@@ -1,0 +1,59 @@
+# Python virtual environments (use singular .venv for session-excluded runtime state)
+.venv/
+env/
+tmp_env/
+venv/
+
+# Python, test, type-check, and formatter caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# GIS source payloads and generated intermediates (keep source/README.md recipes)
+source/*
+!source/README.md
+*.osm
+*.osm.pbf
+*.pbf
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.tif
+*.tiff
+*.vrt
+*.jp2
+*.mbtiles
+*.aux.xml
+*.tmp
+*.temp
+
+# Generated CAD/render outputs and local run caches
+site-plan/
+outputs/
+cache/
+*.dxf
+*.svg
+*.png
+*.pdf
+
+# OS/editor artifacts and secrets
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.env
+.env.*
+!.env.example

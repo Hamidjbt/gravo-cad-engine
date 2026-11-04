@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "cad-fond-de-plan": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/ABSOLUTE/PATH/TO/gravo-cad-engine",
+        "python",
+        "-m",
+        "server.mcp_server"
+      ],
+      "env": {
+        "CAD_FOND_DE_PLAN_OUTPUT_ROOT": "~/site-plan/mcp-runs",
+        "CAD_FOND_DE_PLAN_ALLOWED_ROOT": "~/site-plan"
+      }
+    }
+  }
+}
