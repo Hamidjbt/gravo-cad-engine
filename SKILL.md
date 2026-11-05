@@ -2,7 +2,7 @@
 name: cad-fond-de-plan
 description: "Use when creating a metric monochrome Fond de Plan from OSM, Microsoft footprints, or a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms."
 metadata:
-  version: "1.4.4"
+  version: "1.5.0"
   tags: "geospatial, gis, cad, dxf, osm, urban-planning"
   triggers: "fond de plan, cadastral base map, building footprints to DXF, road casement, architectural site plan"
 ---
@@ -18,7 +18,7 @@ Build a clean vector base map in a local projected CRS. The build path resolves 
 - `--image PATH` enables the current manually traced profile, which requires its configured **1106×1280** pixel frame. `--anchor-x 493`, `--anchor-y 680`, `--gsd 0.12` are estimates, not survey control; replace them only with documented control.
 - `--osm-file PATH` accepts cached OSM XML or GeoPackage. `--footprint-provider microsoft` is the default; select `google-open-buildings` to use Google Open Buildings v3. `--microsoft-file PATH` accepts a cached gzipped GeoJSONL tile. `--google-open-buildings-file PATH` accepts a cached Google CSV/CSV.GZ tile or directory; its default confidence threshold is 0.65 and automatic tile downloads are capped at 250 MB each. Omit the selected provider's file path to use its online acquisition path.
 - Google Open Buildings precision tiers: `--google-target-precision [80|85|90]` applies the published S2 level-4 cell threshold for that estimated precision tier; default `None` keeps the baseline 0.65 cutoff. `--google-thresholds-path PATH` supplies a local/cached thresholds CSV for offline use (otherwise the official CSV is downloaded once and cached under `source/`). Cells with no published value, or an unavailable table, fall back to `--google-min-confidence` (0.65) without failing the build. Report metadata records the applied threshold, target tier, S2 cell ID, and resolution source; precision remains a published estimate.
-- `--output DIR` defaults to `~/site-plan`; `--json` emits the complete report.
+- `--output DIR` defaults to `~/site-plan`; `--json` emits the complete report. `--report-detail summary|full` (default `full`) omits per-feature provenance arrays for archival runs.
 - A3 zoom: `a3_layout_exporter.py --source SVG --output-dir DIR`; default source is `~/site-plan/fond-de-plan-hatched.svg`. It writes A3 landscape **420×297 mm at 1:250** and does not rebuild the base map.
 
 ## Usage
@@ -43,6 +43,8 @@ Use direct `VENV/bin/python PATH/TO/tool.py` if launchers are not on `PATH`. Ins
 Ask for the map link or coordinates, radius/extent, aerial image, any surveyed/GCP control and its pixel convention, desired page/scale, and existing OSM/Microsoft caches. If scale or control is unknown, state uncertainty and ask whether an estimate is acceptable. Confirm whether the requested deliverable is a new base map or a read-only layout derivative. Never infer legal parcel lines from imagery; distinguish traced site boundary from authoritative cadastral data.
 
 ## Tools
+- `tools/deliverable_qa.py`: the single QA contract used by the builder, `check.py`, and MCP `verify_topology`; carry `qa_contract_version` with any verdict.
+- `tools/report_schema.py`: report schema version, input digests, `summary`/`full` detail trimming, determinism comparison.
 - `tools/cad-fond-de-plan-build.py`: base-map build and R2018 DXF architecture; see `--help` for parameters.
 - `tools/urban_topology.py`: deterministic block, courtyard, road-graph, curb, and frontage helpers.
 - `tools/layout_engine.py`: A3/A1/A0 scale/viewport resolver and vector paper-space annotations.
@@ -54,7 +56,7 @@ Ask for the map link or coordinates, radius/extent, aerial image, any surveyed/G
 Python 3.10+; see `requirements.txt`. OSM data is ODbL; Microsoft Global ML footprints are CDLA-Permissive-2.0. Preserve attribution and dataset snapshot/tile identifiers. Treat source images, OSM, and ML footprints as evidence with different accuracy, not interchangeable survey truth.
 
 ## Verification
-Run `pytest -q` from the skill root and `python tools/check.py ~/site-plan`. Inspect the preview manually. Unit tests avoid the network and export pipeline; a passing test suite does not certify survey accuracy.
+Run `make test` then `make lint` from the skill root and `python tools/check.py ~/site-plan`. The builder, `check.py`, and MCP `verify_topology` share one QA contract, so a passing verdict means the same thing everywhere; compare `qa_contract_version` across consumers before treating two verdicts as equivalent. Inspect the preview manually. Unit tests avoid the network and export pipeline; a passing test suite does not certify survey accuracy.
 
 ## Output
 The base build writes hollow/hatched SVG, metric DXF, 300-DPI PNG/PDF, and a JSON provenance/QA report. The read-only A3 tool writes `fond-de-plan-zoom-a3.svg`, `.pdf`, and `-300dpi.png`. Never overwrite an existing plan without the user's explicit request.

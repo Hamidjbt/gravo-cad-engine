@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.4.4. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.5.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -38,6 +38,48 @@ ID, resolution source). Each source footprint also carries `applied_confidence_t
 `s2_cell_id`, and `threshold_resolution_source` in its `attributes`.
 
 Google Open Buildings is licensed under CC BY 4.0 or ODbL 1.0; preserve attribution from the generated report. The test suite uses a tiny checked-in CSV fixture and never downloads dataset tiles.
+
+## Contracts (v1.5.0)
+
+v1.5.0 adds no geometry. It makes the existing engine reachable and verifiable.
+
+### One QA contract
+
+`tools/deliverable_qa.py` is the single implementation of deliverable validation. The builder's
+in-process QA, `tools/check.py`, and the MCP `verify_topology` tool all call it, so one artifact set
+gets one verdict. Results carry `qa_contract_version`.
+
+Layout expectations are declared rather than hard-coded: a run that emits only `A3 1:250` is judged
+against `{A3-1_250}` (from its report) instead of failing for the absent A1/A0 sheets. With no
+declaration the conservative A3+A1+A0 expectation still applies.
+
+### Versioned report schema
+
+`fond-de-plan-report.json` now carries `report_schema_version` (`1.0`), `engine_version`, an
+ISO-8601 `generated_at_utc`, sha256 digests of every footprint source file, the score-thresholds
+CSV, and any cached OSM input, plus the effective build parameters.
+
+`--report-detail summary` omits the per-feature `output_provenance` and
+`source_feature_thresholds` arrays (recording their counts instead) so archival reports stay
+compact; `full` is the default and keeps them. MCP runs use `summary` and return the applied
+confidence policy in the structured result.
+
+`tools/report_schema.py` also exposes `is_deterministic(a, b)`, which compares two reports while
+ignoring declared volatile fields such as `generated_at_utc`.
+
+### MCP surface parity
+
+`generate_cad_plan` now accepts `footprint_provider`, `footprint_file`, `osm_file`,
+`study_radius_m`, `google_min_confidence`, `google_target_precision`, and
+`google_thresholds_file`, and returns the resolved provider, confidence policy, applied thresholds,
+and S2 cell IDs. Invalid combinations are rejected with an explicit message: a precision tier
+requires the Google provider, and a tier without a cached thresholds CSV is refused so a tool call
+never triggers a mid-run dataset download. `list_supported_formats` also reports providers and
+tiers.
+
+### CI
+
+`.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
 
 ## MCP server
 

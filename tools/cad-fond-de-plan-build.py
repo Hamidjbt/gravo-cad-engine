@@ -14,6 +14,7 @@ import re
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import ezdxf
@@ -22,6 +23,7 @@ import osmnx as ox
 import pandas as pd
 import requests
 import svgwrite
+from deliverable_qa import DRAWING_DELIVERABLES, qa_output_directory
 from footprint_providers import (
     OSM_ATTRIBUTION,
     BaseFootprintProvider,
@@ -34,6 +36,7 @@ from footprint_providers import (
 from layout_engine import add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set
 from PIL import Image
 from pyproj import Transformer
+from report_schema import apply_detail, input_provenance, provenance_block
 from scipy.spatial import cKDTree
 from shapely import make_valid, minimum_rotated_rectangle
 from shapely.affinity import rotate
@@ -43,6 +46,8 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
+ENGINE_VERSION = "1.5.0"
+DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
 # polygons. Pixel coordinates are the original 1106 x 1280 JPEG. Roads are centerlines,
@@ -873,79 +878,40 @@ def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Pa
     cairosvg.svg2pdf(url=str(hatched_svg), write_to=str(out_pdf), dpi=96)
 
 
-def qa_outputs(out_dir: Path, building_count: int, hatch_count: int, epsg: int, expected_px: int) -> dict:
-    findings = []
-    for name in [
-        "fond-de-plan-hollow.svg",
-        "fond-de-plan-hatched.svg",
-        "fond-de-plan-cad.dxf",
-        "fond-de-plan-sheet-300dpi.png",
-        "fond-de-plan-sheet-300dpi.pdf",
-    ]:
-        p = out_dir / name
-        if not p.exists() or p.stat().st_size < 100:
-            findings.append(f"missing or tiny deliverable: {name}")
-    from xml.etree import ElementTree as ET
+def qa_outputs(
+    out_dir: Path,
+    building_count: int,
+    hatch_count: int,
+    epsg: int,
+    expected_px: int,
+    *,
+    expected_layouts: list[str] | None = None,
+) -> dict:
+    """Run the shared QA contract over the just-written deliverables.
 
-    try:
-        for n in ["fond-de-plan-hollow.svg", "fond-de-plan-hatched.svg"]:
-            root = ET.parse(out_dir / n).getroot()
-            if root.attrib.get("width") not in ("420mm", "420.0mm") or root.attrib.get("height") not in (
-                "420mm",
-                "420.0mm",
-            ):
-                findings.append(f"wrong SVG sheet dimensions: {n}")
-            if any(el.tag.endswith("text") for el in root.iter()):
-                findings.append(f"text labels are prohibited: {n}")
-    except Exception as e:
-        findings.append(f"SVG parse failed: {e}")
-    try:
-        doc = ezdxf.readfile(out_dir / "fond-de-plan-cad.dxf")
-        required = {
-            "BUILDINGS",
-            "HATCH",
-            "ROADS",
-            "PARCELS",
-            "SITE_BOUNDARY",
-            "G-BLDG-WALL",
-            "G-BLDG-SHARED",
-            "G-ROAD-CURB",
-            "G-ROAD-CL",
-            "G-PARCEL",
-            "G-HATCH",
-            "G-SITE-BOUNDARY",
-            "G-ANNO-GRID",
-            "G-ANNO-NORTH",
-            "G-ANNO-TTLB",
-        }
-        if not required.issubset({layer.dxf.name for layer in doc.layers}):
-            findings.append("DXF missing required architectural layers")
-        if doc.header.get("$INSUNITS") != 6:
-            findings.append("DXF INSUNITS is not meters")
-        if doc.dxfversion != "AC1032":
-            findings.append(f"DXF is not R2018/AC1032: {doc.dxfversion}")
-        if any(e.dxftype() in ("TEXT", "MTEXT") for e in doc.modelspace()):
-            findings.append("DXF contains model-space labels; annotation belongs in paper space")
-        if "GRID_CROSS" not in doc.blocks or "NORTH_ARROW" not in doc.blocks:
-            findings.append("DXF missing reusable grid-cross or north-arrow block")
-    except Exception as e:
-        findings.append(f"DXF parse failed: {e}")
-    try:
-        with Image.open(out_dir / "fond-de-plan-sheet-300dpi.png") as im:
-            if im.size != (expected_px, expected_px):
-                findings.append(f"PNG is not {expected_px} x {expected_px}: {im.size}")
-            if round(im.info.get("dpi", (0, 0))[0]) != 300:
-                findings.append(f"PNG DPI metadata is not 300: {im.info.get('dpi')}")
-            if im.mode not in ("RGB", "RGBA"):
-                findings.append(f"unexpected PNG color mode: {im.mode}")
-    except Exception as e:
-        findings.append(f"PNG parse failed: {e}")
+    Delegates to :mod:`deliverable_qa` so the builder, ``tools/check.py`` and the
+    MCP ``verify_topology`` tool cannot disagree about the same artifact set.
+    The report is not yet written at this point, so layout and pixel
+    expectations are supplied explicitly by the caller.
+    """
+    result = qa_output_directory(
+        out_dir,
+        include_report=False,
+        expected_layouts=frozenset(expected_layouts or ()),
+        expected_png_px=expected_px,
+    )
+    findings = [finding for finding in result["findings"] if not finding.startswith("missing deliverable:")]
+    for name in DRAWING_DELIVERABLES:
+        candidate = out_dir / name
+        if not candidate.exists() or candidate.stat().st_size < 100:
+            findings.append(f"missing or tiny deliverable: {name}")
     return {
         "ok": not findings,
         "findings": findings,
         "orthogonalized_buildings": building_count,
         "clipped_hatch_segments": hatch_count,
         "epsg": epsg,
+        "qa_contract_version": result.get("qa_contract_version"),
     }
 
 
@@ -1015,6 +981,7 @@ def regularize_footprint_records(records: list[FootprintRecord], site: Polygon, 
 
 
 def build(args) -> dict:
+    generated_at_utc = datetime.now(UTC).isoformat(timespec="seconds")
     out_dir = Path(args.output).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "source").mkdir(exist_ok=True)
@@ -1050,9 +1017,8 @@ def build(args) -> dict:
     else:
         manual_roads, manual_parcels, site = [], [], Polygon()
 
-    osm, osm_source, osm_method = acquire_osm(
-        lat, lon, radius, out_dir, Path(args.osm_file).expanduser() if args.osm_file else None
-    )
+    local_osm_file = Path(args.osm_file).expanduser() if args.osm_file else None
+    osm, osm_source, osm_method = acquire_osm(lat, lon, radius, out_dir, local_osm_file)
     if osm.crs is None:
         osm = osm.set_crs(4326)
     osm = osm[osm.geometry.notna()].copy()
@@ -1173,13 +1139,21 @@ def build(args) -> dict:
     png_path, pdf_path = out_dir / "fond-de-plan-sheet-300dpi.png", out_dir / "fond-de-plan-sheet-300dpi.pdf"
     render_sheet(hollow, hatched, png_path, pdf_path, sheet_mm)
     expected_px = round(sheet_mm / 25.4 * 300)
-    qa = qa_outputs(out_dir, len(buildings), len(hatch_geoms), epsg, expected_px)
     layout_sheets = (
         [f"{layout_spec[0]} 1:{layout_spec[1]}"]
         if layout_spec
         else ["A3 1:250", "A1 1:500", "A0 1:1000"]
         if layout_bounds_m
         else []
+    )
+    expected_layout_names = [label.replace(" ", "-").replace(":", "_") for label in layout_sheets]
+    qa = qa_outputs(
+        out_dir,
+        len(buildings),
+        len(hatch_geoms),
+        epsg,
+        expected_px,
+        expected_layouts=expected_layout_names,
     )
     footprint_summary = build_footprint_summary(
         provider,
@@ -1282,8 +1256,28 @@ def build(args) -> dict:
                 "fond-de-plan-cad.dxf",
                 "fond-de-plan-sheet-300dpi.png",
                 "fond-de-plan-sheet-300dpi.pdf",
+                "fond-de-plan-report.json",
             ]
-        },
+        }
+        | {"sheet_mm": sheet_mm, "expected_png_px": expected_px},
+        "provenance": provenance_block(
+            engine_version=ENGINE_VERSION,
+            generated_at=generated_at_utc,
+            inputs=[
+                *input_provenance(footprint_paths),
+                *input_provenance([thresholds_path] if thresholds_path else [], role="score_thresholds_csv"),
+                *input_provenance([local_osm_file] if local_osm_file else [], role="osm_source"),
+            ],
+            parameters={
+                "footprint_provider": provider.name,
+                "google_min_confidence": min_confidence,
+                "google_target_precision": target_precision,
+                "radius_m": radius,
+                "sheet_mm": sheet_mm,
+                "layout_sheets": layout_sheets,
+                "epsg": epsg,
+            },
+        ),
         "qa": qa,
         "attribution": attribution,
         "warnings": [
@@ -1294,6 +1288,7 @@ def build(args) -> dict:
             *threshold_warnings,
         ],
     }
+    report = apply_detail(report, getattr(args, "report_detail", DEFAULT_REPORT_DETAIL))
     (out_dir / "fond-de-plan-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
@@ -1348,6 +1343,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layout-sheet", choices=("A3", "A1", "A0"), help="add one exact-scale paper-space layout")
     p.add_argument(
         "--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet"
+    )
+    p.add_argument(
+        "--report-detail",
+        choices=("summary", "full"),
+        default=DEFAULT_REPORT_DETAIL,
+        help="summary omits per-feature provenance arrays to keep archival reports compact",
     )
     p.add_argument("--json", action="store_true", help="emit JSON report to stdout")
     return p

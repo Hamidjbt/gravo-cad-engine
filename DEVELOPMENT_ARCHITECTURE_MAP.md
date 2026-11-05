@@ -1,6 +1,6 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.4.4  
+**Current release:** 1.5.0  
 **Last updated:** 2026-11-05  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
@@ -83,6 +83,15 @@ Release **1.4.3** introduced the opt-in Google Open Buildings v3 provider (`--fo
 Release **1.4.4** adds region-aware confidence filtering. Google publishes per-S2-level-4-cell score thresholds for estimated 80%, 85%, and 90% precision tiers; the provider indexes those cell polygons with a Shapely `STRtree` and resolves each footprint centroid against them. `--google-target-precision [80|85|90]` (default `None`) selects the tier and `--google-thresholds-path` supplies a local/cached thresholds CSV, so resolution can run fully offline.
 
 Fallback is explicit and never fatal: no covering cell, a cell missing the requested tier, or an unusable/absent table all revert to the baseline `0.65` minimum confidence with a distinct `threshold_resolution_source` label. Applied threshold, target tier, S2 cell ID, and resolution source are recorded on each source footprint and aggregated in the report (`footprints` section) along with a note that the tier is a dataset-published estimate rather than a measured accuracy. Offline fixtures and unit tests cover exact cell match, tier-dependent filtering, missing-value fallback, out-of-cell fallback, invalid precision, unreadable/missing threshold files, cached reuse, and report provenance.
+
+### Phase 6 — Contract and surface parity (1.5.0)
+
+Phase 5 added provider capability that the agent-facing MCP surface could not reach, and the two QA paths disagreed. Release **1.5.0** fixes both without adding geometry:
+
+- **One QA contract.** `tools/deliverable_qa.py` implements deliverable validation once. The builder's in-process QA, `tools/check.py`, and MCP `verify_topology` all delegate to it, so one artifact set yields one verdict. Layout expectations became declarative: the report's `paper_layouts.sheets` defines what a run must contain, so a single-layout MCP run is no longer failed for absent A1/A0 sheets, while an undeclared run keeps the conservative A3+A1+A0 expectation. `check.py` shrank to a CLI shell; its stronger per-layer lineweight/color/linetype assertions became the shared baseline.
+- **Versioned report schema.** `report_schema.py` owns `report_schema_version` (`1.0`), `engine_version`, `generated_at_utc`, sha256 digests for footprint sources, the thresholds CSV, and cached OSM input, plus effective build parameters. `--report-detail summary` replaces `output_provenance` and `source_feature_thresholds` with count-bearing omission records; `full` remains the default.
+- **MCP surface parity.** `generate_cad_plan` gained `footprint_provider`, `footprint_file`, `osm_file`, `study_radius_m`, `google_min_confidence`, `google_target_precision`, and `google_thresholds_file`, and returns the resolved provider, confidence policy, applied thresholds, and S2 cell IDs. A precision tier requires the Google provider and a cached thresholds CSV, so a tool call cannot silently trigger a mid-run dataset download.
+- **CI gate.** `.github/workflows/ci.yml` runs `make test` then `make lint` on push and pull request.
 
 ---
 
@@ -233,7 +242,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.4.4**.
+- Skill/manifest version: **1.5.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.
