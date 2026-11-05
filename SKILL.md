@@ -10,13 +10,13 @@ metadata:
 # Cad Fond De Plan
 
 ## Workflow
-Build a clean vector base map in a local projected CRS. The build path resolves a map pin or coordinates, queries/caches OSM, fetches Microsoft Global ML footprints, normalizes geometries in UTM, regularizes footprints, conservatively snaps near-coextensive shared walls while preserving holes/area, nodes same-grade road centerlines into a graph, synthesizes node-aware curbs, reconciles near-curb parcel frontage, and traces the configured aerial profile when supplied. The R2018 DXF carries architectural G-* layers, reusable grid-cross/north-arrow blocks, and—when a site boundary is available—A3 1:250, A1 1:500, and A0 1:1000 paper layouts with UTM/WGS84/area cartouche and scale bar. Google Open Buildings is not yet an implemented provider; do not claim it was queried.
+Build a clean vector base map in a local projected CRS. The build path resolves a map pin or coordinates, queries/caches OSM, uses Microsoft Global ML footprints by default or opt-in Google Open Buildings v3, normalizes geometries in UTM, regularizes footprints, conservatively snaps near-coextensive shared walls while preserving holes/area, nodes same-grade road centerlines into a graph, synthesizes node-aware curbs, reconciles near-curb parcel frontage, and traces the configured aerial profile when supplied. The R2018 DXF carries architectural G-* layers, reusable grid-cross/north-arrow blocks, and—when a site boundary is available—A3 1:250, A1 1:500, and A0 1:1000 paper layouts with UTM/WGS84/area cartouche and scale bar. Google Open Buildings is queried only when explicitly selected; preserve its CC BY 4.0 or ODbL 1.0 attribution and confidence scores.
 
 ## Inputs and defaults
 - Required location: `--maps-url URL` or both `--lat LAT --lon LON`; UTM EPSG is selected from location.
 - `--radius METRES` defaults to `300`; `--sheet-mm MM` defaults to `420` for the square base sheet.
 - `--image PATH` enables the current manually traced profile, which requires its configured **1106×1280** pixel frame. `--anchor-x 493`, `--anchor-y 680`, `--gsd 0.12` are estimates, not survey control; replace them only with documented control.
-- `--osm-file PATH` accepts cached OSM XML or GeoPackage. `--microsoft-file PATH` accepts a cached gzipped GeoJSONL tile. Omit either to use the documented online acquisition path.
+- `--osm-file PATH` accepts cached OSM XML or GeoPackage. `--footprint-provider microsoft` is the default; select `google-open-buildings` to use Google Open Buildings v3. `--microsoft-file PATH` accepts a cached gzipped GeoJSONL tile. `--google-open-buildings-file PATH` accepts a cached Google CSV/CSV.GZ tile or directory; its default confidence threshold is 0.65 and automatic tile downloads are capped at 250 MB each. Omit the selected provider's file path to use its online acquisition path.
 - `--output DIR` defaults to `~/site-plan`; `--json` emits the complete report.
 - A3 zoom: `a3_layout_exporter.py --source SVG --output-dir DIR`; default source is `~/site-plan/fond-de-plan-hatched.svg`. It writes A3 landscape **420×297 mm at 1:250** and does not rebuild the base map.
 

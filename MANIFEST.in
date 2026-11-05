@@ -1,3 +1,4 @@
+include README.md
 include DEVELOPMENT_ARCHITECTURE_MAP.md
 include SKILL.md
 include skill.json
@@ -6,4 +7,4 @@ include Makefile
 include claude_desktop_config.json
 recursive-include server *.py
 recursive-include tools *.py *.sh
-recursive-include tests *.py
+recursive-include tests *.py *.csv

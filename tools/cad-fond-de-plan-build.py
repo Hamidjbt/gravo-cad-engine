@@ -4,20 +4,17 @@
 Metric model coordinates are retained in the selected UTM zone. SVG/PDF are paper-space
 sheets at a declared print scale. No raster edge detection or external tile imagery is used.
 """
+
 from __future__ import annotations
 
 import argparse
-import csv
-import gzip
 import json
 import math
 import re
-import sys
-import time
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import ezdxf
 import geopandas as gpd
@@ -25,32 +22,122 @@ import osmnx as ox
 import pandas as pd
 import requests
 import svgwrite
+from footprint_providers import (
+    OSM_ATTRIBUTION,
+    BaseFootprintProvider,
+    FootprintRecord,
+    MicrosoftFootprintProvider,
+    get_footprint_provider,
+    merge_footprint_records,
+)
+from layout_engine import add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set
 from PIL import Image
-from pyproj import CRS, Transformer
+from pyproj import Transformer
 from scipy.spatial import cKDTree
 from shapely import make_valid, minimum_rotated_rectangle
-from shapely.affinity import rotate, scale as scale_affine
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, shape
-from shapely.ops import transform, unary_union
+from shapely.affinity import rotate
+from shapely.affinity import scale as scale_affine
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon
+from shapely.ops import transform
+from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
-from urban_topology import (build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph,
-                            snap_shared_walls)
-from layout_engine import (add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set)
-
-MS_INDEX = "https://bfppub.blob.core.windows.net/$web/2026-07-24/dataset-links.csv"
-MS_PREFIX = "https://bfppub.z5.web.core.windows.net/2026-07-24/"
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ATTRIBUTION = "© OpenStreetMap contributors (ODbL); Microsoft Global ML Building Footprints (CDLA-Permissive-2.0); reference aerial supplied by user."
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
 # polygons. Pixel coordinates are the original 1106 x 1280 JPEG. Roads are centerlines,
 # widths are measured/estimated from visible pavement; these are not cadastral survey lines.
 PHOTO_ROADS = [
-    ([(0, 379), (45, 367), (92, 354), (145, 346), (205, 343), (266, 345), (326, 351), (390, 352), (460, 349), (535, 346), (604, 342), (664, 341), (703, 355), (726, 377)], 5.0),
-    ([(340, 352), (328, 370), (319, 394), (316, 430), (316, 485), (317, 545), (315, 612), (318, 683), (326, 735), (346, 774)], 4.8),
-    ([(42, 394), (39, 447), (40, 503), (44, 558), (47, 620), (45, 684), (50, 744), (56, 799), (61, 864), (65, 940), (68, 1030), (70, 1120), (73, 1279)], 4.6),
-    ([(346, 773), (383, 785), (429, 797), (477, 808), (528, 819), (580, 829), (631, 839), (674, 852), (704, 876), (713, 912), (715, 960), (719, 1013), (727, 1072)], 5.0),
-    ([(721, 379), (739, 405), (753, 438), (767, 476), (781, 518), (794, 560), (805, 603), (813, 644), (814, 678), (807, 709), (794, 735), (776, 756), (753, 775), (728, 799), (708, 822), (697, 850)], 4.6),
+    (
+        [
+            (0, 379),
+            (45, 367),
+            (92, 354),
+            (145, 346),
+            (205, 343),
+            (266, 345),
+            (326, 351),
+            (390, 352),
+            (460, 349),
+            (535, 346),
+            (604, 342),
+            (664, 341),
+            (703, 355),
+            (726, 377),
+        ],
+        5.0,
+    ),
+    (
+        [
+            (340, 352),
+            (328, 370),
+            (319, 394),
+            (316, 430),
+            (316, 485),
+            (317, 545),
+            (315, 612),
+            (318, 683),
+            (326, 735),
+            (346, 774),
+        ],
+        4.8,
+    ),
+    (
+        [
+            (42, 394),
+            (39, 447),
+            (40, 503),
+            (44, 558),
+            (47, 620),
+            (45, 684),
+            (50, 744),
+            (56, 799),
+            (61, 864),
+            (65, 940),
+            (68, 1030),
+            (70, 1120),
+            (73, 1279),
+        ],
+        4.6,
+    ),
+    (
+        [
+            (346, 773),
+            (383, 785),
+            (429, 797),
+            (477, 808),
+            (528, 819),
+            (580, 829),
+            (631, 839),
+            (674, 852),
+            (704, 876),
+            (713, 912),
+            (715, 960),
+            (719, 1013),
+            (727, 1072),
+        ],
+        5.0,
+    ),
+    (
+        [
+            (721, 379),
+            (739, 405),
+            (753, 438),
+            (767, 476),
+            (781, 518),
+            (794, 560),
+            (805, 603),
+            (813, 644),
+            (814, 678),
+            (807, 709),
+            (794, 735),
+            (776, 756),
+            (753, 775),
+            (728, 799),
+            (708, 822),
+            (697, 850),
+        ],
+        4.6,
+    ),
     ([(0, 798), (47, 792), (92, 789), (139, 786), (184, 787), (225, 792), (270, 795), (314, 779)], 4.4),
     ([(702, 1130), (770, 1122), (843, 1119), (922, 1125), (1003, 1138), (1080, 1151), (1105, 1156)], 4.5),
 ]
@@ -64,13 +151,45 @@ PHOTO_PARCELS = [
 ]
 # Inner edge of the road-ringed vacant plot, interpreted directly from the supplied aerial.
 SITE_PIXELS = [
-    (340, 414), (339, 390), (347, 375), (362, 363), (389, 358), (454, 357),
-    (525, 359), (597, 360), (654, 365), (690, 376), (711, 393), (720, 423),
-    (728, 462), (740, 505), (751, 550), (762, 594), (772, 637), (783, 675),
-    (786, 708), (776, 732), (756, 749), (727, 762), (690, 769), (649, 766),
-    (602, 759), (551, 751), (502, 746), (452, 745), (408, 753), (371, 762),
-    (351, 758), (341, 741), (336, 711), (334, 670), (334, 621), (334, 571),
-    (335, 523), (336, 476), (338, 440),
+    (340, 414),
+    (339, 390),
+    (347, 375),
+    (362, 363),
+    (389, 358),
+    (454, 357),
+    (525, 359),
+    (597, 360),
+    (654, 365),
+    (690, 376),
+    (711, 393),
+    (720, 423),
+    (728, 462),
+    (740, 505),
+    (751, 550),
+    (762, 594),
+    (772, 637),
+    (783, 675),
+    (786, 708),
+    (776, 732),
+    (756, 749),
+    (727, 762),
+    (690, 769),
+    (649, 766),
+    (602, 759),
+    (551, 751),
+    (502, 746),
+    (452, 745),
+    (408, 753),
+    (371, 762),
+    (351, 758),
+    (341, 741),
+    (336, 711),
+    (334, 670),
+    (334, 621),
+    (334, 571),
+    (335, 523),
+    (336, 476),
+    (338, 440),
 ]
 
 
@@ -84,7 +203,11 @@ def resolve_maps_url(url: str) -> tuple[float, float, str]:
     final = r.url
     candidates = [final, urllib.parse.unquote(final)]
     for candidate in candidates:
-        for pattern in (r"[?&](?:q|query)=(-?\d+(?:\.\d+)?)[,%20]+(-?\d+(?:\.\d+)?)", r"/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)"):
+        for pattern in (
+            r"[?&](?:q|query)=(-?\d+(?:\.\d+)?)[,%20]+(-?\d+(?:\.\d+)?)",
+            r"/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)",
+            r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)",
+        ):
             m = re.search(pattern, candidate)
             if m:
                 return float(m.group(1)), float(m.group(2)), final
@@ -170,52 +293,23 @@ def acquire_osm(lat: float, lon: float, radius: float, out_dir: Path, local_file
         xml_path.parent.mkdir(parents=True, exist_ok=True)
         xml_path.write_bytes(response.content)
         gdf = ox.features_from_xml(xml_path, tags=tags)
-        return gdf, f"OpenStreetMap API map bbox fallback; Overpass error: {type(overpass_error).__name__}", "osm-api-map-bbox"
+        return (
+            gdf,
+            f"OpenStreetMap API map bbox fallback; Overpass error: {type(overpass_error).__name__}",
+            "osm-api-map-bbox",
+        )
 
 
 def acquire_microsoft(lat: float, lon: float, out_dir: Path, local_file: Path | None):
-    if local_file:
-        return local_file, f"local Microsoft footprint tile: {local_file}"
-    src_dir = out_dir / "source"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    index_path = src_dir / "microsoft-dataset-links.csv"
-    if not index_path.exists():
-        response = requests.get(MS_INDEX, timeout=180, headers={"User-Agent": "cad-fond-de-plan/1.0"})
-        response.raise_for_status()
-        index_path.write_bytes(response.content)
-    links = pd.read_csv(index_path, dtype={"QuadKey": str})
-    target = quadkey(lat, lon, 9)
-    matches = links[(links["QuadKey"] == target) & links["Location"].str.lower().eq("algeria")]
-    if matches.empty:
-        matches = links[(links["QuadKey"].astype(str).str.startswith(target) | links["QuadKey"].astype(str).apply(lambda q: target.startswith(q))) & links["Location"].str.lower().eq("algeria")]
-    if matches.empty:
-        raise RuntimeError(f"No Microsoft building tile found for quadkey {target}; provide --microsoft-file")
-    row = matches.iloc[0]
-    tile_path = src_dir / f"microsoft-{row['Location']}-{row['QuadKey']}.csv.gz"
-    if not tile_path.exists():
-        response = requests.get(row["Url"], timeout=240, headers={"User-Agent": "cad-fond-de-plan/1.0"})
-        response.raise_for_status()
-        tile_path.write_bytes(response.content)
-    return tile_path, f"Microsoft Global ML Building Footprints, {row['Location']} quadkey {row['QuadKey']} ({row['Url']})"
+    """Backward-compatible Microsoft acquisition wrapper."""
+    paths, source = MicrosoftFootprintProvider().acquire(lat, lon, 0.0, out_dir, local_file)
+    return paths[0], source
 
 
 def read_microsoft(path: Path, to_utm: Transformer, study_circle: Polygon) -> list[Polygon]:
-    out: list[Polygon] = []
-    # Microsoft's current public files are GeoJSONL compressed despite the .csv.gz suffix.
-    with gzip.open(path, "rt", encoding="utf-8") as stream:
-        for line in stream:
-            if not line.strip():
-                continue
-            try:
-                feature = json.loads(line)
-                geom = shape(feature["geometry"])
-                if not geom.is_empty:
-                    projected = transform(to_utm.transform, geom)
-                    if projected.intersects(study_circle):
-                        out.extend(flatten_polygons(make_valid(projected)))
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
-    return out
+    """Backward-compatible geometry-only reader; new code should retain records."""
+    records = MicrosoftFootprintProvider().read([path], to_utm, study_circle)
+    return [record.geometry for record in records]
 
 
 def axial_mean(angles: Iterable[float], weights: Iterable[float] | None = None) -> float:
@@ -225,8 +319,8 @@ def axial_mean(angles: Iterable[float], weights: Iterable[float] | None = None) 
     ws = list(weights) if weights is not None else [1.0] * len(vals)
     if len(ws) != len(vals) or not any(w > 0 for w in ws):
         return vals[0]
-    x = sum(w * math.cos(2 * a) for a, w in zip(vals, ws))
-    y = sum(w * math.sin(2 * a) for a, w in zip(vals, ws))
+    x = sum(w * math.cos(2 * a) for a, w in zip(vals, ws, strict=True))
+    y = sum(w * math.sin(2 * a) for a, w in zip(vals, ws, strict=True))
     if math.hypot(x, y) < 1e-10:
         return vals[0]
     return 0.5 * math.atan2(y, x)
@@ -246,7 +340,7 @@ def rect_axis(poly: Polygon) -> tuple[float, float]:
     rect = minimum_rotated_rectangle(poly)
     coords = list(rect.exterior.coords)
     edges = []
-    for a, b in zip(coords, coords[1:]):
+    for a, b in zip(coords, coords[1:], strict=False):
         dx, dy = b[0] - a[0], b[1] - a[1]
         length = math.hypot(dx, dy)
         if length > 1e-9:
@@ -277,11 +371,13 @@ def clean_ring(coords: list[tuple[float, float]], min_segment: float) -> list[tu
 class _UF:
     def __init__(self, n: int):
         self.p = list(range(n))
+
     def find(self, x: int) -> int:
         while self.p[x] != x:
             self.p[x] = self.p[self.p[x]]
             x = self.p[x]
         return x
+
     def union(self, a: int, b: int):
         a, b = self.find(a), self.find(b)
         if a != b:
@@ -295,7 +391,7 @@ def orthogonal_ring(coords, axis: float, min_segment: float) -> list[tuple[float
     if len(world) < 4:
         world = [(float(x), float(y)) for x, y, *_ in coords[:-1]]
     c, s = math.cos(axis), math.sin(axis)
-    local = [(c*x + s*y, -s*x + c*y) for x, y in world]
+    local = [(c * x + s * y, -s * x + c * y) for x, y in world]
     n = len(local)
     if n < 4:
         return world
@@ -312,10 +408,10 @@ def orthogonal_ring(coords, axis: float, min_segment: float) -> list[tuple[float
     for i, (x, y) in enumerate(local):
         xgroups.setdefault(ux.find(i), []).append(x)
         ygroups.setdefault(uy.find(i), []).append(y)
-    ox = {k: sum(v)/len(v) for k, v in xgroups.items()}
-    oy = {k: sum(v)/len(v) for k, v in ygroups.items()}
+    ox = {k: sum(v) / len(v) for k, v in xgroups.items()}
+    oy = {k: sum(v) / len(v) for k, v in ygroups.items()}
     orth = [(ox[ux.find(i)], oy[uy.find(i)]) for i in range(n)]
-    return [(c*x - s*y, s*x + c*y) for x, y in orth]
+    return [(c * x - s * y, s * x + c * y) for x, y in orth]
 
 
 def orthogonalize(poly: Polygon, axis: float, min_segment: float = 1.2) -> tuple[Polygon, bool]:
@@ -385,8 +481,9 @@ def orthogonalize(poly: Polygon, axis: float, min_segment: float = 1.2) -> tuple
         aspect_error = abs(final_ratio - target_ratio) / target_ratio
         source_holes = sorted(Polygon(r).area for r in source.interiors)
         final_holes = sorted(Polygon(r).area for r in corrected.interiors)
-        hole_errors = [abs(after - before) / max(before, 1e-8)
-                       for before, after in zip(source_holes, final_holes)]
+        hole_errors = [
+            abs(after - before) / max(before, 1e-8) for before, after in zip(source_holes, final_holes, strict=False)
+        ]
         if area_error > 0.05 or aspect_error > 0.05 or any(err > 0.05 for err in hole_errors):
             return source, True
         return corrected, False
@@ -395,8 +492,7 @@ def orthogonalize(poly: Polygon, axis: float, min_segment: float = 1.2) -> tuple
         return source, True
 
 
-def building_axes(polys: list[Polygon], radius_m: float = 35.0,
-                  cluster_tolerance_deg: float = 15.0) -> list[float]:
+def building_axes(polys: list[Polygon], radius_m: float = 35.0, cluster_tolerance_deg: float = 15.0) -> list[float]:
     """Estimate dominant axes without averaging distinct street/building directions.
 
     Elongated footprints contribute a confidence-weighted axial mean only to a nearby
@@ -433,7 +529,9 @@ def building_axes(polys: list[Polygon], radius_m: float = 35.0,
     return axes
 
 
-def pixel_to_world(pix: tuple[float, float], cx: float, cy: float, anchor: tuple[float, float], gsd: float) -> tuple[float, float]:
+def pixel_to_world(
+    pix: tuple[float, float], cx: float, cy: float, anchor: tuple[float, float], gsd: float
+) -> tuple[float, float]:
     x, y = pix
     return cx + (x - anchor[0]) * gsd, cy - (y - anchor[1]) * gsd
 
@@ -452,9 +550,21 @@ def image_lines(cx, cy, anchor, gsd) -> tuple[list[tuple[LineString, float]], li
 
 def road_width(tags: dict) -> float:
     highway = str(tags.get("highway", "residential"))
-    widths = {"motorway": 12.0, "trunk": 9.0, "primary": 8.0, "secondary": 6.5, "tertiary": 5.5,
-              "unclassified": 5.0, "residential": 4.8, "living_street": 4.0, "service": 3.4,
-              "pedestrian": 3.0, "footway": 1.6, "path": 1.3, "track": 3.0}
+    widths = {
+        "motorway": 12.0,
+        "trunk": 9.0,
+        "primary": 8.0,
+        "secondary": 6.5,
+        "tertiary": 5.5,
+        "unclassified": 5.0,
+        "residential": 4.8,
+        "living_street": 4.0,
+        "service": 3.4,
+        "pedestrian": 3.0,
+        "footway": 1.6,
+        "path": 1.3,
+        "track": 3.0,
+    }
     width_tag = tags.get("width")
     if width_tag:
         m = re.search(r"(\d+(?:\.\d+)?)", str(width_tag))
@@ -463,9 +573,15 @@ def road_width(tags: dict) -> float:
     return widths.get(highway, 4.8)
 
 
-def road_casements(osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Polygon,
-                    cx: float, cy: float, manual_roads: list[tuple[LineString, float]],
-                    return_graph: bool = False):
+def road_casements(
+    osm: gpd.GeoDataFrame,
+    to_utm: Transformer,
+    study_circle: Polygon,
+    cx: float,
+    cy: float,
+    manual_roads: list[tuple[LineString, float]],
+    return_graph: bool = False,
+):
     """Build a same-level, noded centerline graph, then synthesize curb surfaces.
 
     The default 3-tuple return is kept for existing callers. Set ``return_graph`` to
@@ -475,7 +591,7 @@ def road_casements(osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Pol
     segments = []
     osm_count = manual_count = 0
     source_crs = osm.crs.to_epsg() if osm.crs is not None else None
-    for geom, tags in zip(osm.geometry, osm.to_dict("records")):
+    for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
         if geom is None or not tags.get("highway"):
             continue
         projected = transform(to_utm.transform, geom) if source_crs == 4326 else geom
@@ -496,17 +612,20 @@ def road_casements(osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Pol
                 segments.append((part, width, {"source": "reference-aerial", "highway": "local"}))
                 manual_count += 1
     graph = build_road_graph(segments)
-    corridor = road_corridor_from_graph(graph).intersection(study_circle) if graph.number_of_edges() else GeometryCollection()
+    corridor = (
+        road_corridor_from_graph(graph).intersection(study_circle) if graph.number_of_edges() else GeometryCollection()
+    )
     if return_graph:
         return corridor, osm_count, manual_count, graph
     return corridor, osm_count, manual_count
 
 
-def extract_parcels(osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Polygon,
-                    manual: list[LineString], cx: float, cy: float) -> list[LineString]:
+def extract_parcels(
+    osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Polygon, manual: list[LineString], cx: float, cy: float
+) -> list[LineString]:
     lines = list(manual)
     local_cut = Point(cx, cy).buffer(82.0)
-    for geom, tags in zip(osm.geometry, osm.to_dict("records")):
+    for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
         if geom is None:
             continue
         if tags.get("landuse") or tags.get("barrier") or tags.get("natural"):
@@ -561,27 +680,51 @@ def svg_path_polygon(poly: Polygon, center, scale) -> str:
     commands = []
     for ring in [poly.exterior, *poly.interiors]:
         pts = [mm_point(x, y, center, scale) for x, y in ring.coords]
-        commands.append(f"M {pts[0][0]:.4f},{pts[0][1]:.4f} " + " ".join(f"L {x:.4f},{y:.4f}" for x, y in pts[1:]) + " Z")
+        commands.append(
+            f"M {pts[0][0]:.4f},{pts[0][1]:.4f} " + " ".join(f"L {x:.4f},{y:.4f}" for x, y in pts[1:]) + " Z"
+        )
     return " ".join(commands)
 
 
-def write_svg(path: Path, buildings: list[Polygon], road_boundaries, parcels: list[LineString], site: Polygon,
-              hatch_geoms: list[LineString], center: tuple[float, float], sheet_mm: float, scale_mm_m: float,
-              hatched: bool):
-    dwg = svgwrite.Drawing(str(path), size=(f"{sheet_mm}mm", f"{sheet_mm}mm"), viewBox=f"0 0 {sheet_mm} {sheet_mm}", profile="full")
+def write_svg(
+    path: Path,
+    buildings: list[Polygon],
+    road_boundaries,
+    parcels: list[LineString],
+    site: Polygon,
+    hatch_geoms: list[LineString],
+    center: tuple[float, float],
+    sheet_mm: float,
+    scale_mm_m: float,
+    hatched: bool,
+):
+    dwg = svgwrite.Drawing(
+        str(path), size=(f"{sheet_mm}mm", f"{sheet_mm}mm"), viewBox=f"0 0 {sheet_mm} {sheet_mm}", profile="full"
+    )
     dwg.add(dwg.rect(insert=(0, 0), size=(sheet_mm, sheet_mm), fill="#FFFFFF"))
-    g_roads = dwg.g(id="ROADS", fill="none", stroke="#000000", stroke_width="0.35", stroke_linecap="butt", stroke_linejoin="round")
+    g_roads = dwg.g(
+        id="ROADS", fill="none", stroke="#000000", stroke_width="0.35", stroke_linecap="butt", stroke_linejoin="round"
+    )
     p = svg_path_line(road_boundaries, center, scale_mm_m)
     if p:
         g_roads.add(dwg.path(d=p))
     dwg.add(g_roads)
-    g_parcels = dwg.g(id="PARCELS", fill="none", stroke="#000000", stroke_width="0.18", stroke_linecap="butt", stroke_linejoin="miter")
+    g_parcels = dwg.g(
+        id="PARCELS", fill="none", stroke="#000000", stroke_width="0.18", stroke_linecap="butt", stroke_linejoin="miter"
+    )
     for line in parcels:
         d = svg_path_line(line, center, scale_mm_m)
         if d:
             g_parcels.add(dwg.path(d=d))
     dwg.add(g_parcels)
-    g_build = dwg.g(id="BUILDINGS", fill="#FFFFFF", stroke="#000000", stroke_width="0.50", fill_rule="evenodd", stroke_linejoin="miter")
+    g_build = dwg.g(
+        id="BUILDINGS",
+        fill="#FFFFFF",
+        stroke="#000000",
+        stroke_width="0.50",
+        fill_rule="evenodd",
+        stroke_linejoin="miter",
+    )
     for poly in buildings:
         g_build.add(dwg.path(d=svg_path_polygon(poly, center, scale_mm_m)))
     dwg.add(g_build)
@@ -593,12 +736,22 @@ def write_svg(path: Path, buildings: list[Polygon], road_boundaries, parcels: li
                 g_hatch.add(dwg.path(d=d))
         dwg.add(g_hatch)
         # Redraw walls over the clipped hatch to preserve a crisp architectural perimeter.
-        g_outer = dwg.g(id="BUILDING_WALLS_OVER_HATCH", fill="none", stroke="#000000", stroke_width="0.50", stroke_linejoin="miter")
+        g_outer = dwg.g(
+            id="BUILDING_WALLS_OVER_HATCH", fill="none", stroke="#000000", stroke_width="0.50", stroke_linejoin="miter"
+        )
         for poly in buildings:
             g_outer.add(dwg.path(d=svg_path_polygon(poly, center, scale_mm_m)))
         dwg.add(g_outer)
     if not site.is_empty:
-        g_site = dwg.g(id="SITE_BOUNDARY", fill="none", stroke="#000000", stroke_width="0.60", stroke_dasharray="4 2", stroke_linecap="butt", stroke_linejoin="round")
+        g_site = dwg.g(
+            id="SITE_BOUNDARY",
+            fill="none",
+            stroke="#000000",
+            stroke_width="0.60",
+            stroke_dasharray="4 2",
+            stroke_linecap="butt",
+            stroke_linejoin="round",
+        )
         g_site.add(dwg.path(d=svg_path_polygon(site, center, scale_mm_m)))
         dwg.add(g_site)
     dwg.save(pretty=True)
@@ -612,10 +765,21 @@ def add_dxf_polyline(msp, ring, close: bool, layer: str):
         msp.add_lwpolyline([(float(x), float(y)) for x, y, *_ in pts], close=close, dxfattribs={"layer": layer})
 
 
-def write_dxf(path: Path, buildings: list[Polygon], road_boundaries, parcels: list[LineString], site: Polygon,
-              hatch_geoms: list[LineString], epsg: int, center: tuple[float, float], scale_mm_m: float,
-              road_centerlines=None, shared_walls=None, layout_bounds_m=None,
-              layout_spec: tuple[str, int] | None = None):
+def write_dxf(
+    path: Path,
+    buildings: list[Polygon],
+    road_boundaries,
+    parcels: list[LineString],
+    site: Polygon,
+    hatch_geoms: list[LineString],
+    epsg: int,
+    center: tuple[float, float],
+    scale_mm_m: float,
+    road_centerlines=None,
+    shared_walls=None,
+    layout_bounds_m=None,
+    layout_spec: tuple[str, int] | None = None,
+):
     """Write a metric R2018 model plus optional exact-scale multi-sheet paper layouts."""
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 6  # meters
@@ -645,8 +809,9 @@ def write_dxf(path: Path, buildings: list[Polygon], road_boundaries, parcels: li
         "G-ANNO-TTLB": {"color": 7, "lineweight": 35},
     }
     if "SITE_DASH" not in doc.linetypes:
-        doc.linetypes.add("SITE_DASH", pattern=[4.0 / scale_mm_m, -2.0 / scale_mm_m],
-                          description="4mm dash / 2mm gap at sheet scale")
+        doc.linetypes.add(
+            "SITE_DASH", pattern=[4.0 / scale_mm_m, -2.0 / scale_mm_m], description="4mm dash / 2mm gap at sheet scale"
+        )
     if "CENTER" not in doc.linetypes:
         doc.linetypes.add("CENTER", pattern=[1.25, -0.25, 0.25, -0.25], description="Road centerline")
     for name, attrs in layers.items():
@@ -662,7 +827,7 @@ def write_dxf(path: Path, buildings: list[Polygon], road_boundaries, parcels: li
         add_dxf_polyline(msp, poly.exterior, True, "G-BLDG-WALL")
         for ring in poly.interiors:
             add_dxf_polyline(msp, ring, True, "G-BLDG-WALL")
-    for candidate in (shared_walls or []):
+    for candidate in shared_walls or []:
         for line in flatten_lines(candidate):
             add_dxf_polyline(msp, line, False, "G-BLDG-SHARED")
     for line in hatch_geoms:
@@ -673,14 +838,18 @@ def write_dxf(path: Path, buildings: list[Polygon], road_boundaries, parcels: li
             add_dxf_polyline(msp, ring, True, "G-SITE-BOUNDARY")
     if road_centerlines is not None:
         from layout_engine import ensure_annotation_blocks
+
         ensure_annotation_blocks(doc)
         for candidate in road_centerlines:
             for line in flatten_lines(candidate):
                 add_dxf_polyline(msp, line, False, "G-ROAD-CL")
 
     if layout_bounds_m is not None:
-        layouts = ([resolve_layout(tuple(layout_bounds_m), layout_spec[0], layout_spec[1])]
-                   if layout_spec else resolve_sheet_set(tuple(layout_bounds_m)))
+        layouts = (
+            [resolve_layout(tuple(layout_bounds_m), layout_spec[0], layout_spec[1])]
+            if layout_spec
+            else resolve_sheet_set(tuple(layout_bounds_m))
+        )
         area = float(site.area) if site is not None and not site.is_empty else None
         focus_e = (float(layout_bounds_m[0]) + float(layout_bounds_m[2])) / 2.0
         focus_n = (float(layout_bounds_m[1]) + float(layout_bounds_m[3])) / 2.0
@@ -693,8 +862,11 @@ def write_dxf(path: Path, buildings: list[Polygon], road_boundaries, parcels: li
 
 def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Path, sheet_mm: float):
     import cairosvg
+
     width_px = round(sheet_mm / 25.4 * 300)
-    cairosvg.svg2png(url=str(hatched_svg), write_to=str(out_png), output_width=width_px, output_height=width_px, dpi=300)
+    cairosvg.svg2png(
+        url=str(hatched_svg), write_to=str(out_png), output_width=width_px, output_height=width_px, dpi=300
+    )
     with Image.open(out_png) as im:
         im.save(out_png, dpi=(300, 300), optimize=True)
     cairosvg.svg2pdf(url=str(hatched_svg), write_to=str(out_pdf), dpi=96)
@@ -702,15 +874,25 @@ def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Pa
 
 def qa_outputs(out_dir: Path, building_count: int, hatch_count: int, epsg: int, expected_px: int) -> dict:
     findings = []
-    for name in ["fond-de-plan-hollow.svg", "fond-de-plan-hatched.svg", "fond-de-plan-cad.dxf", "fond-de-plan-sheet-300dpi.png", "fond-de-plan-sheet-300dpi.pdf"]:
+    for name in [
+        "fond-de-plan-hollow.svg",
+        "fond-de-plan-hatched.svg",
+        "fond-de-plan-cad.dxf",
+        "fond-de-plan-sheet-300dpi.png",
+        "fond-de-plan-sheet-300dpi.pdf",
+    ]:
         p = out_dir / name
         if not p.exists() or p.stat().st_size < 100:
             findings.append(f"missing or tiny deliverable: {name}")
     from xml.etree import ElementTree as ET
+
     try:
         for n in ["fond-de-plan-hollow.svg", "fond-de-plan-hatched.svg"]:
             root = ET.parse(out_dir / n).getroot()
-            if root.attrib.get("width") not in ("420mm", "420.0mm") or root.attrib.get("height") not in ("420mm", "420.0mm"):
+            if root.attrib.get("width") not in ("420mm", "420.0mm") or root.attrib.get("height") not in (
+                "420mm",
+                "420.0mm",
+            ):
                 findings.append(f"wrong SVG sheet dimensions: {n}")
             if any(el.tag.endswith("text") for el in root.iter()):
                 findings.append(f"text labels are prohibited: {n}")
@@ -718,9 +900,23 @@ def qa_outputs(out_dir: Path, building_count: int, hatch_count: int, epsg: int, 
         findings.append(f"SVG parse failed: {e}")
     try:
         doc = ezdxf.readfile(out_dir / "fond-de-plan-cad.dxf")
-        required = {"BUILDINGS", "HATCH", "ROADS", "PARCELS", "SITE_BOUNDARY", "G-BLDG-WALL",
-                    "G-BLDG-SHARED", "G-ROAD-CURB", "G-ROAD-CL", "G-PARCEL", "G-HATCH",
-                    "G-SITE-BOUNDARY", "G-ANNO-GRID", "G-ANNO-NORTH", "G-ANNO-TTLB"}
+        required = {
+            "BUILDINGS",
+            "HATCH",
+            "ROADS",
+            "PARCELS",
+            "SITE_BOUNDARY",
+            "G-BLDG-WALL",
+            "G-BLDG-SHARED",
+            "G-ROAD-CURB",
+            "G-ROAD-CL",
+            "G-PARCEL",
+            "G-HATCH",
+            "G-SITE-BOUNDARY",
+            "G-ANNO-GRID",
+            "G-ANNO-NORTH",
+            "G-ANNO-TTLB",
+        }
         if not required.issubset({layer.dxf.name for layer in doc.layers}):
             findings.append("DXF missing required architectural layers")
         if doc.header.get("$INSUNITS") != 6:
@@ -743,7 +939,39 @@ def qa_outputs(out_dir: Path, building_count: int, hatch_count: int, epsg: int, 
                 findings.append(f"unexpected PNG color mode: {im.mode}")
     except Exception as e:
         findings.append(f"PNG parse failed: {e}")
-    return {"ok": not findings, "findings": findings, "orthogonalized_buildings": building_count, "clipped_hatch_segments": hatch_count, "epsg": epsg}
+    return {
+        "ok": not findings,
+        "findings": findings,
+        "orthogonalized_buildings": building_count,
+        "clipped_hatch_segments": hatch_count,
+        "epsg": epsg,
+    }
+
+
+def regularize_footprint_records(records: list[FootprintRecord], site: Polygon, study_circle: Polygon):
+    """Run inferred/OSM provider records through normalization and block topology.
+
+    Returned lineage is index-aligned with ``BlockTopology.footprints`` so each final
+    geometry can retain its source ID and score in the report.
+    """
+    axes = building_axes([record.geometry for record in records])
+    ortho_raw: list[Polygon] = []
+    output_sources: list[FootprintRecord] = []
+    conservative_fallbacks = vacant_site_false_positives = 0
+    for record, axis in zip(records, axes, strict=True):
+        poly = record.geometry
+        if not site.is_empty and poly.intersection(site).area / max(poly.area, 1e-8) > 0.08:
+            vacant_site_false_positives += 1
+            continue
+        regular, used_fallback = orthogonalize(poly, axis, 1.2)
+        if not regular.is_empty and regular.area >= 4.0:
+            clipped = regular.intersection(study_circle)
+            output_parts = [part for part in flatten_polygons(clipped) if part.area >= 3.0]
+            ortho_raw.extend(output_parts)
+            output_sources.extend([record] * len(output_parts))
+            conservative_fallbacks += int(used_fallback)
+    topology = snap_shared_walls(ortho_raw, max_gap_m=0.8, max_area_change=0.05)
+    return topology, output_sources, conservative_fallbacks, vacant_site_false_positives
 
 
 def build(args) -> dict:
@@ -758,7 +986,6 @@ def build(args) -> dict:
         raise ValueError("Supply --maps-url or both --lat and --lon")
     epsg = utm_epsg(lat, lon)
     to_utm = Transformer.from_crs(4326, epsg, always_xy=True)
-    to_wgs = Transformer.from_crs(epsg, 4326, always_xy=True)
     cx, cy = to_utm.transform(lon, lat)
     center = Point(cx, cy)
     radius = float(args.radius)
@@ -772,7 +999,9 @@ def build(args) -> dict:
         with Image.open(image_path) as img:
             photo_size = img.size
         if photo_size != (1106, 1280):
-            raise ValueError(f"configured photo control frame expects 1106x1280 pixels, received {photo_size}; provide correct georeferencing controls")
+            raise ValueError(
+                f"configured photo control frame expects 1106x1280 pixels, received {photo_size}; provide correct georeferencing controls"
+            )
         manual_roads, manual_parcels, site = image_lines(cx, cy, anchor, gsd)
         site = site.intersection(study_circle)
         if not isinstance(site, Polygon):
@@ -781,7 +1010,9 @@ def build(args) -> dict:
     else:
         manual_roads, manual_parcels, site = [], [], Polygon()
 
-    osm, osm_source, osm_method = acquire_osm(lat, lon, radius, out_dir, Path(args.osm_file).expanduser() if args.osm_file else None)
+    osm, osm_source, osm_method = acquire_osm(
+        lat, lon, radius, out_dir, Path(args.osm_file).expanduser() if args.osm_file else None
+    )
     if osm.crs is None:
         osm = osm.set_crs(4326)
     osm = osm[osm.geometry.notna()].copy()
@@ -792,54 +1023,50 @@ def build(args) -> dict:
     osm_metric["geometry"] = osm_metric.geometry.intersection(study_circle)
     osm_metric = osm_metric[~osm_metric.geometry.is_empty].copy()
 
-    ms_path, ms_source = acquire_microsoft(lat, lon, out_dir, Path(args.microsoft_file).expanduser() if args.microsoft_file else None)
-    ms_buildings = read_microsoft(ms_path, to_utm, study_circle)
-    osm_buildings = []
-    for _, row in osm_metric.iterrows():
+    provider_name = getattr(args, "footprint_provider", "microsoft")
+    provider: BaseFootprintProvider = get_footprint_provider(
+        provider_name, getattr(args, "google_max_download_mb", 250.0)
+    )
+    if provider_name == "google-open-buildings":
+        local_footprint_file = getattr(args, "google_open_buildings_file", None)
+        min_confidence = getattr(args, "google_min_confidence", provider.default_min_confidence)
+    else:
+        local_footprint_file = getattr(args, "microsoft_file", None)
+        min_confidence = None
+    if local_footprint_file:
+        local_footprint_file = Path(local_footprint_file).expanduser()
+    footprint_paths, footprint_source = provider.acquire(lat, lon, radius, out_dir, local_footprint_file)
+    provider_records = provider.read(footprint_paths, to_utm, study_circle, min_confidence)
+
+    osm_records: list[FootprintRecord] = []
+    for row_index, row in osm_metric.iterrows():
         if pd.notna(row.get("building")):
-            osm_buildings.extend(p for p in flatten_polygons(row.geometry) if p.area >= 4.0)
-    # Retain OSM geometry over near-identical ML detections; otherwise Microsoft fills gaps.
-    merged = list(osm_buildings)
-    for candidate in ms_buildings:
-        if candidate.area < 5.0:
-            continue
-        duplicate = False
-        for known in osm_buildings:
-            inter = candidate.intersection(known).area
-            if inter / max(min(candidate.area, known.area), 1e-8) > 0.62:
-                duplicate = True
-                break
-        if not duplicate:
-            merged.append(candidate)
-    # Remove identical Microsoft overlaps with a spatial index-like sorted pass.
-    merged.sort(key=lambda g: -g.area)
-    unique = []
-    for candidate in merged:
-        if any(candidate.intersection(prev).area / max(min(candidate.area, prev.area), 1e-8) > 0.88 for prev in unique[:120]):
-            continue
-        unique.append(candidate)
-    axes = building_axes(unique)
-    ortho_raw, conservative_fallbacks, vacant_site_false_positives = [], 0, 0
-    for poly, axis in zip(unique, axes):
-        # A source footprint substantially inside the visually verified vacant lot is a
-        # model false positive; drop it rather than letting an AI blob occupy the target.
-        if not site.is_empty and poly.intersection(site).area / max(poly.area, 1e-8) > 0.08:
-            vacant_site_false_positives += 1
-            continue
-        regular, used_fallback = orthogonalize(poly, axis, 1.2)
-        if not regular.is_empty and regular.area >= 4.0:
-            clipped = regular.intersection(study_circle)
-            ortho_raw.extend(p for p in flatten_polygons(clipped) if p.area >= 3.0)
-            conservative_fallbacks += int(used_fallback)
-    # Preserve discrete footprints; no union across adjacent houses. Shared-wall
-    # midline snapping is conservative and each candidate must retain area within 5%.
-    block_topology = snap_shared_walls(ortho_raw, max_gap_m=0.8, max_area_change=0.05)
+            osm_id = str(row_index)
+            osm_records.extend(
+                FootprintRecord(
+                    polygon,
+                    "osm",
+                    f"osm:{osm_id}",
+                    None,
+                    "ODbL-1.0",
+                    {"osm_id": osm_id},
+                )
+                for polygon in flatten_polygons(row.geometry)
+                if polygon.area >= 4.0
+            )
+    # OSM retains priority over near-identical inferred outlines; all records retain
+    # their original source IDs/confidence through deduplication and topology.
+    unique_records = merge_footprint_records(osm_records, provider_records)
+    block_topology, ortho_sources, conservative_fallbacks, vacant_site_false_positives = regularize_footprint_records(
+        unique_records, site, study_circle
+    )
     buildings = block_topology.footprints
 
     # Road casements: node aerial/OSM centerlines at same-level junctions, synthesize
     # curb surfaces from the graph, and reconcile only near-curb parcel frontage vertices.
     road_casement, osm_road_count, photo_road_count, road_graph = road_casements(
-        osm, to_utm, study_circle, cx, cy, manual_roads, return_graph=True)
+        osm, to_utm, study_circle, cx, cy, manual_roads, return_graph=True
+    )
     road_boundaries = road_casement.boundary if not road_casement.is_empty else GeometryCollection()
     road_centerlines = [data["geometry"] for _, _, _, data in road_graph.edges(keys=True, data=True)]
     parcels = extract_parcels(osm, to_utm, study_circle, manual_parcels, cx, cy)
@@ -857,35 +1084,154 @@ def build(args) -> dict:
     hatched = out_dir / "fond-de-plan-hatched.svg"
     write_svg(hollow, buildings, road_boundaries, parcels, site, [], (cx, cy), sheet_mm, scale_mm_m, False)
     write_svg(hatched, buildings, road_boundaries, parcels, site, hatch_geoms, (cx, cy), sheet_mm, scale_mm_m, True)
-    layout_bounds_m = (tuple(site.bounds) if not site.is_empty else
-                       tuple(study_circle.bounds) if getattr(args, "layout_sheet", None) else None)
+    layout_bounds_m = (
+        tuple(site.bounds)
+        if not site.is_empty
+        else tuple(study_circle.bounds)
+        if getattr(args, "layout_sheet", None)
+        else None
+    )
     layout_spec = None
     if getattr(args, "layout_sheet", None):
         default_scales = {"A3": 250, "A1": 500, "A0": 1000}
         layout_spec = (args.layout_sheet, args.layout_scale or default_scales[args.layout_sheet])
-    write_dxf(out_dir / "fond-de-plan-cad.dxf", buildings, road_boundaries, parcels, site, hatch_geoms,
-              epsg, (cx, cy), scale_mm_m, road_centerlines=road_centerlines,
-              shared_walls=block_topology.shared_walls, layout_bounds_m=layout_bounds_m,
-              layout_spec=layout_spec)
+    write_dxf(
+        out_dir / "fond-de-plan-cad.dxf",
+        buildings,
+        road_boundaries,
+        parcels,
+        site,
+        hatch_geoms,
+        epsg,
+        (cx, cy),
+        scale_mm_m,
+        road_centerlines=road_centerlines,
+        shared_walls=block_topology.shared_walls,
+        layout_bounds_m=layout_bounds_m,
+        layout_spec=layout_spec,
+    )
     png_path, pdf_path = out_dir / "fond-de-plan-sheet-300dpi.png", out_dir / "fond-de-plan-sheet-300dpi.pdf"
     render_sheet(hollow, hatched, png_path, pdf_path, sheet_mm)
     expected_px = round(sheet_mm / 25.4 * 300)
     qa = qa_outputs(out_dir, len(buildings), len(hatch_geoms), epsg, expected_px)
-    layout_sheets = ([f"{layout_spec[0]} 1:{layout_spec[1]}"] if layout_spec else
-                     ["A3 1:250", "A1 1:500", "A0 1:1000"] if layout_bounds_m else [])
+    layout_sheets = (
+        [f"{layout_spec[0]} 1:{layout_spec[1]}"]
+        if layout_spec
+        else ["A3 1:250", "A1 1:500", "A0 1:1000"]
+        if layout_bounds_m
+        else []
+    )
+    confidence_scores = [record.confidence for record in provider_records if record.confidence is not None]
+    source_counts = {}
+    for record in unique_records:
+        source_counts[record.provider] = source_counts.get(record.provider, 0) + 1
+    building_provenance = [record.provenance(index) for index, record in enumerate(ortho_sources)]
+    footprint_summary = {
+        "provider": provider.name,
+        "source": footprint_source,
+        "source_files": [str(path) for path in footprint_paths],
+        "attribution": provider.attribution,
+        "confidence_threshold": min_confidence,
+        "source_records_loaded": len(provider_records),
+        "source_confidence_mean": (sum(confidence_scores) / len(confidence_scores) if confidence_scores else None),
+        "source_confidence_min": min(confidence_scores) if confidence_scores else None,
+        "source_confidence_max": max(confidence_scores) if confidence_scores else None,
+        "unique_input_footprints_after_osm_merge": len(unique_records),
+        "unique_input_counts_by_provider": source_counts,
+        "final_output_footprints": len(building_provenance),
+        "output_provenance": building_provenance,
+    }
+    legacy_provider_report = {}
+    if provider_name == "microsoft":
+        legacy_provider_report["microsoft"] = {
+            "source": footprint_source,
+            "tile": footprint_paths[0].name,
+            "footprints_intersecting_300m_before_dedup": len(provider_records),
+            "merged_unique_input_footprints": len(unique_records),
+        }
+    attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}; reference aerial supplied by user."
     report = {
-        "ok": qa["ok"], "findings": qa["findings"], "center": {"lat": lat, "lon": lon, "utm_x_m": cx, "utm_y_m": cy, "epsg": epsg, "zone": (epsg % 100)},
-        "google_maps_resolved_url": resolved_url, "radius_m": radius, "scale": f"1:{(2*radius*1000/sheet_mm):.1f}",
-        "photo_georeference": {"path": str(image_path) if image_path else None, "anchor_pixel": list(anchor), "anchor_coordinate": [lat, lon], "gsd_m_per_pixel": gsd, "rotation_deg": 0.0, "method": "north-up scale/translation fitted by visual registration of Microsoft building polygons against the supplied JPEG; not a cadastral survey"},
-        "osm": {"source": osm_source, "method": osm_method, "raw_features_in_300m": len(osm_metric), "roads_used_outside_local_photo_block": osm_road_count, "photo_traced_road_centerlines": photo_road_count, "source_building_polygons": len(osm_buildings), "landuse_barrier_natural_features": int(sum(any(pd.notna(r.get(k)) and str(r.get(k)).strip() for k in ("landuse", "barrier", "natural")) for r in osm_metric.to_dict("records")))},
-        "microsoft": {"source": ms_source, "tile": ms_path.name, "footprints_intersecting_300m_before_dedup": len(ms_buildings), "merged_unique_input_footprints": len(unique)},
-        "building_regularization": {"algorithm": "dominant MRR axis with 15-degree axial neighborhood modes; local x/y correction conserves source area and aspect within 5%; candidate shared-wall midline snap rejects invalid, hole-changing, or >5% area changes", "output_buildings": len(buildings), "conservative_source_fallbacks": conservative_fallbacks, "false_positives_removed_inside_vacant_site": vacant_site_false_positives, "hatch_spacing_world_m": hatch_spacing_m, "hatch_segments": len(hatch_geoms)},
-        "block_topology": {"shared_wall_segments": len(block_topology.shared_walls), "adjacent_footprint_pairs": block_topology.adjacency.number_of_edges(), "polygonized_block_faces": len(block_topology.faces), "courtyard_widths_m": {str(k): list(v) for k, v in block_topology.courtyard_widths_m.items()}, "diagnostics": block_topology.diagnostics},
-        "roads": {"method": "same-level noded centerline graph; flat-ended edge buffers plus junction patches; corridor dissolved and clipped to study area", "graph_nodes": road_graph.number_of_nodes(), "graph_edges": road_graph.number_of_edges(), "frontage_lines_reconciled": frontage_snaps, "manual_photo_roads": photo_road_count, "osm_road_parts": osm_road_count},
-        "paper_layouts": {"sheets": layout_sheets, "layout_bounds_m": list(layout_bounds_m) if layout_bounds_m else None, "cartouche_mm": [180, 50], "grid_spacing_m": "50 (A3/A1), 100 (A0)"},
-        "site_boundary": {"source": "manual vector trace from supplied aerial; inferred parcel edge where vegetation obscures curb", "area_m2": round(site.area, 1) if not site.is_empty else None},
-        "outputs": {n: str(out_dir/n) for n in ["fond-de-plan-hollow.svg", "fond-de-plan-hatched.svg", "fond-de-plan-cad.dxf", "fond-de-plan-sheet-300dpi.png", "fond-de-plan-sheet-300dpi.pdf"]},
-        "qa": qa, "attribution": ATTRIBUTION, "warnings": ["Reference JPEG has no EXIF geotags/scale; image georeferencing is an estimated 0.12 m/px alignment to the map pin and Microsoft footprints, not survey-grade.", "Public Overpass endpoints were unavailable/empty during the data check; the OpenStreetMap API map-bbox XML extract was used and clipped to the 300 m radius.", "The east-side connector of the local road loop is partly interpreted beneath tree/shadow cover; verify against current orthophoto or survey.", "Microsoft ML building outlines are machine-generated, and all AI-derived geometry is architecturally orthogonalized; check against a licensed cadastral survey before legal boundary use."]
+        "ok": qa["ok"],
+        "findings": qa["findings"],
+        "center": {"lat": lat, "lon": lon, "utm_x_m": cx, "utm_y_m": cy, "epsg": epsg, "zone": (epsg % 100)},
+        "google_maps_resolved_url": resolved_url,
+        "radius_m": radius,
+        "scale": f"1:{(2 * radius * 1000 / sheet_mm):.1f}",
+        "photo_georeference": {
+            "path": str(image_path) if image_path else None,
+            "anchor_pixel": list(anchor),
+            "anchor_coordinate": [lat, lon],
+            "gsd_m_per_pixel": gsd,
+            "rotation_deg": 0.0,
+            "method": f"north-up scale/translation visually registered against {provider.name} footprints; not a cadastral survey",
+        },
+        "osm": {
+            "source": osm_source,
+            "method": osm_method,
+            "raw_features_in_300m": len(osm_metric),
+            "roads_used_outside_local_photo_block": osm_road_count,
+            "photo_traced_road_centerlines": photo_road_count,
+            "source_building_polygons": len(osm_records),
+            "landuse_barrier_natural_features": int(
+                sum(
+                    any(pd.notna(r.get(k)) and str(r.get(k)).strip() for k in ("landuse", "barrier", "natural"))
+                    for r in osm_metric.to_dict("records")
+                )
+            ),
+        },
+        "footprints": footprint_summary,
+        **legacy_provider_report,
+        "building_regularization": {
+            "algorithm": "dominant MRR axis with 15-degree axial neighborhood modes; local x/y correction conserves source area and aspect within 5%; candidate shared-wall midline snap rejects invalid, hole-changing, or >5% area changes",
+            "output_buildings": len(buildings),
+            "conservative_source_fallbacks": conservative_fallbacks,
+            "false_positives_removed_inside_vacant_site": vacant_site_false_positives,
+            "hatch_spacing_world_m": hatch_spacing_m,
+            "hatch_segments": len(hatch_geoms),
+        },
+        "block_topology": {
+            "shared_wall_segments": len(block_topology.shared_walls),
+            "adjacent_footprint_pairs": block_topology.adjacency.number_of_edges(),
+            "polygonized_block_faces": len(block_topology.faces),
+            "courtyard_widths_m": {str(k): list(v) for k, v in block_topology.courtyard_widths_m.items()},
+            "diagnostics": block_topology.diagnostics,
+        },
+        "roads": {
+            "method": "same-level noded centerline graph; flat-ended edge buffers plus junction patches; corridor dissolved and clipped to study area",
+            "graph_nodes": road_graph.number_of_nodes(),
+            "graph_edges": road_graph.number_of_edges(),
+            "frontage_lines_reconciled": frontage_snaps,
+            "manual_photo_roads": photo_road_count,
+            "osm_road_parts": osm_road_count,
+        },
+        "paper_layouts": {
+            "sheets": layout_sheets,
+            "layout_bounds_m": list(layout_bounds_m) if layout_bounds_m else None,
+            "cartouche_mm": [180, 50],
+            "grid_spacing_m": "50 (A3/A1), 100 (A0)",
+        },
+        "site_boundary": {
+            "source": "manual vector trace from supplied aerial; inferred parcel edge where vegetation obscures curb",
+            "area_m2": round(site.area, 1) if not site.is_empty else None,
+        },
+        "outputs": {
+            n: str(out_dir / n)
+            for n in [
+                "fond-de-plan-hollow.svg",
+                "fond-de-plan-hatched.svg",
+                "fond-de-plan-cad.dxf",
+                "fond-de-plan-sheet-300dpi.png",
+                "fond-de-plan-sheet-300dpi.pdf",
+            ]
+        },
+        "qa": qa,
+        "attribution": attribution,
+        "warnings": [
+            f"Reference JPEG has no EXIF geotags/scale; image georeferencing is an estimated {gsd:g} m/px alignment to the map pin and {provider.name} footprints, not survey-grade.",
+            "Public Overpass endpoints were unavailable/empty during the data check; the OpenStreetMap API map-bbox XML extract was used and clipped to the 300 m radius.",
+            "The east-side connector of the local road loop is partly interpreted beneath tree/shadow cover; verify against current orthophoto or survey.",
+            f"{provider.name} footprints are machine-generated, and all inferred geometry is architecturally orthogonalized; check against a licensed cadastral survey before legal boundary use.",
+        ],
     }
     (out_dir / "fond-de-plan-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
@@ -902,18 +1248,53 @@ def main() -> int:
     p.add_argument("--anchor-y", type=float, default=680.0, help="photo pixel mapped to maps URL coordinate")
     p.add_argument("--gsd", type=float, default=0.12, help="estimated ground sample distance, metres per pixel")
     p.add_argument("--osm-file", help="cached OSM XML or GeoPackage; omit to query Overpass then OSM API fallback")
+    p.add_argument(
+        "--footprint-provider",
+        choices=("microsoft", "google-open-buildings"),
+        default="microsoft",
+        help="building footprint source (Microsoft remains the default)",
+    )
     p.add_argument("--microsoft-file", help="cached Microsoft GeoJSONL .csv.gz tile; omit to resolve/download tile")
+    p.add_argument(
+        "--google-open-buildings-file", help="cached Google Open Buildings v3 CSV/CSV.GZ tile or directory of tiles"
+    )
+    p.add_argument(
+        "--google-min-confidence",
+        type=float,
+        default=0.65,
+        help="minimum Google Open Buildings score [0,1] (default: 0.65)",
+    )
+    p.add_argument(
+        "--google-max-download-mb",
+        type=float,
+        default=250.0,
+        help="maximum automatic download size per Google tile; larger tiles require a supplied cache",
+    )
     p.add_argument("--output", default=str(Path.home() / "site-plan"))
     p.add_argument("--sheet-mm", type=float, default=420.0)
     p.add_argument("--layout-sheet", choices=("A3", "A1", "A0"), help="add one exact-scale paper-space layout")
-    p.add_argument("--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet")
+    p.add_argument(
+        "--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet"
+    )
     p.add_argument("--json", action="store_true", help="emit JSON report to stdout")
     a = p.parse_args()
     if a.layout_scale and not a.layout_sheet:
         p.error("--layout-scale requires --layout-sheet")
     try:
         result = build(a)
-        print(json.dumps(result, indent=2) if a.json else json.dumps({"ok": result["ok"], "output": a.output, "buildings": result["building_regularization"]["output_buildings"], "epsg": result["center"]["epsg"], "findings": result["findings"]}))
+        print(
+            json.dumps(result, indent=2)
+            if a.json
+            else json.dumps(
+                {
+                    "ok": result["ok"],
+                    "output": a.output,
+                    "buildings": result["building_regularization"]["output_buildings"],
+                    "epsg": result["center"]["epsg"],
+                    "findings": result["findings"],
+                }
+            )
+        )
         return 0 if result["ok"] else 1
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2))
