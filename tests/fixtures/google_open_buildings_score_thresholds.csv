@@ -1,0 +1,4 @@
+s2_token,geometry,confidence_threshold_80%_precision,confidence_threshold_85%_precision,confidence_threshold_90%_precision,building_count_80%_precision,building_count_85%_precision,building_count_90%_precision,building_count
+oran-cell-test,"POLYGON ((-0.6411 35.6999, -0.6406 35.6999, -0.6406 35.7002, -0.6411 35.7002, -0.6411 35.6999))",0.55,0.80,0.90,120,100,75,140
+unscored-cell-test,"POLYGON ((-0.6382 35.6999, -0.6379 35.6999, -0.6379 35.7002, -0.6382 35.7002, -0.6382 35.6999))",0.72,0.80,,55,40,0,60
+neighbor-cell-test,"POLYGON ((-0.6300 35.6999, -0.6295 35.6999, -0.6295 35.7002, -0.6300 35.7002, -0.6300 35.6999))",0.73,0.82,0.92,90,70,45,110

@@ -2,7 +2,7 @@
 name: cad-fond-de-plan
 description: "Use when creating a metric monochrome Fond de Plan from OSM, Microsoft footprints, or a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms."
 metadata:
-  version: "1.4.2"
+  version: "1.4.4"
   tags: "geospatial, gis, cad, dxf, osm, urban-planning"
   triggers: "fond de plan, cadastral base map, building footprints to DXF, road casement, architectural site plan"
 ---
@@ -17,6 +17,7 @@ Build a clean vector base map in a local projected CRS. The build path resolves 
 - `--radius METRES` defaults to `300`; `--sheet-mm MM` defaults to `420` for the square base sheet.
 - `--image PATH` enables the current manually traced profile, which requires its configured **1106×1280** pixel frame. `--anchor-x 493`, `--anchor-y 680`, `--gsd 0.12` are estimates, not survey control; replace them only with documented control.
 - `--osm-file PATH` accepts cached OSM XML or GeoPackage. `--footprint-provider microsoft` is the default; select `google-open-buildings` to use Google Open Buildings v3. `--microsoft-file PATH` accepts a cached gzipped GeoJSONL tile. `--google-open-buildings-file PATH` accepts a cached Google CSV/CSV.GZ tile or directory; its default confidence threshold is 0.65 and automatic tile downloads are capped at 250 MB each. Omit the selected provider's file path to use its online acquisition path.
+- Google Open Buildings precision tiers: `--google-target-precision [80|85|90]` applies the published S2 level-4 cell threshold for that estimated precision tier; default `None` keeps the baseline 0.65 cutoff. `--google-thresholds-path PATH` supplies a local/cached thresholds CSV for offline use (otherwise the official CSV is downloaded once and cached under `source/`). Cells with no published value, or an unavailable table, fall back to `--google-min-confidence` (0.65) without failing the build. Report metadata records the applied threshold, target tier, S2 cell ID, and resolution source; precision remains a published estimate.
 - `--output DIR` defaults to `~/site-plan`; `--json` emits the complete report.
 - A3 zoom: `a3_layout_exporter.py --source SVG --output-dir DIR`; default source is `~/site-plan/fond-de-plan-hatched.svg`. It writes A3 landscape **420×297 mm at 1:250** and does not rebuild the base map.
 

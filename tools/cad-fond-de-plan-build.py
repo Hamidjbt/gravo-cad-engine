@@ -29,6 +29,7 @@ from footprint_providers import (
     MicrosoftFootprintProvider,
     get_footprint_provider,
     merge_footprint_records,
+    threshold_provenance_report,
 )
 from layout_engine import add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set
 from PIL import Image
@@ -948,6 +949,45 @@ def qa_outputs(out_dir: Path, building_count: int, hatch_count: int, epsg: int, 
     }
 
 
+def build_footprint_summary(
+    provider: BaseFootprintProvider,
+    footprint_source: str,
+    footprint_paths: list[Path],
+    min_confidence: float | None,
+    provider_records: list[FootprintRecord],
+    unique_records: list[FootprintRecord],
+    ortho_sources: list[FootprintRecord],
+    target_precision: int | None = None,
+    thresholds_path: Path | None = None,
+    thresholds_source: str = "not-requested",
+) -> dict:
+    """Assemble report-ready footprint provenance, including threshold policy.
+
+    Kept free of I/O so the report contract can be regression-tested offline.
+    """
+    confidence_scores = [record.confidence for record in provider_records if record.confidence is not None]
+    source_counts: dict[str, int] = {}
+    for record in unique_records:
+        source_counts[record.provider] = source_counts.get(record.provider, 0) + 1
+    building_provenance = [record.provenance(index) for index, record in enumerate(ortho_sources)]
+    return {
+        "provider": provider.name,
+        "source": footprint_source,
+        "source_files": [str(path) for path in footprint_paths],
+        "attribution": provider.attribution,
+        "confidence_threshold": min_confidence,
+        **threshold_provenance_report(provider_records, target_precision, thresholds_path, thresholds_source),
+        "source_records_loaded": len(provider_records),
+        "source_confidence_mean": (sum(confidence_scores) / len(confidence_scores) if confidence_scores else None),
+        "source_confidence_min": min(confidence_scores) if confidence_scores else None,
+        "source_confidence_max": max(confidence_scores) if confidence_scores else None,
+        "unique_input_footprints_after_osm_merge": len(unique_records),
+        "unique_input_counts_by_provider": source_counts,
+        "final_output_footprints": len(building_provenance),
+        "output_provenance": building_provenance,
+    }
+
+
 def regularize_footprint_records(records: list[FootprintRecord], site: Polygon, study_circle: Polygon):
     """Run inferred/OSM provider records through normalization and block topology.
 
@@ -1027,16 +1067,36 @@ def build(args) -> dict:
     provider: BaseFootprintProvider = get_footprint_provider(
         provider_name, getattr(args, "google_max_download_mb", 250.0)
     )
+    thresholds_path = None
+    thresholds_source = "not-requested"
+    target_precision = None
     if provider_name == "google-open-buildings":
         local_footprint_file = getattr(args, "google_open_buildings_file", None)
         min_confidence = getattr(args, "google_min_confidence", provider.default_min_confidence)
+        target_precision = getattr(args, "google_target_precision", None)
+        requested_thresholds = getattr(args, "google_thresholds_path", None)
     else:
         local_footprint_file = getattr(args, "microsoft_file", None)
         min_confidence = None
+        requested_thresholds = None
     if local_footprint_file:
         local_footprint_file = Path(local_footprint_file).expanduser()
     footprint_paths, footprint_source = provider.acquire(lat, lon, radius, out_dir, local_footprint_file)
-    provider_records = provider.read(footprint_paths, to_utm, study_circle, min_confidence)
+    if provider_name == "google-open-buildings" and target_precision is not None:
+        thresholds_path, thresholds_source = provider.acquire_thresholds(
+            out_dir, Path(requested_thresholds).expanduser() if requested_thresholds else None
+        )
+        provider_records = provider.read(
+            footprint_paths,
+            to_utm,
+            study_circle,
+            min_confidence,
+            target_precision=target_precision,
+            thresholds_path=thresholds_path,
+            thresholds_source=thresholds_source,
+        )
+    else:
+        provider_records = provider.read(footprint_paths, to_utm, study_circle, min_confidence)
 
     osm_records: list[FootprintRecord] = []
     for row_index, row in osm_metric.iterrows():
@@ -1121,26 +1181,18 @@ def build(args) -> dict:
         if layout_bounds_m
         else []
     )
-    confidence_scores = [record.confidence for record in provider_records if record.confidence is not None]
-    source_counts = {}
-    for record in unique_records:
-        source_counts[record.provider] = source_counts.get(record.provider, 0) + 1
-    building_provenance = [record.provenance(index) for index, record in enumerate(ortho_sources)]
-    footprint_summary = {
-        "provider": provider.name,
-        "source": footprint_source,
-        "source_files": [str(path) for path in footprint_paths],
-        "attribution": provider.attribution,
-        "confidence_threshold": min_confidence,
-        "source_records_loaded": len(provider_records),
-        "source_confidence_mean": (sum(confidence_scores) / len(confidence_scores) if confidence_scores else None),
-        "source_confidence_min": min(confidence_scores) if confidence_scores else None,
-        "source_confidence_max": max(confidence_scores) if confidence_scores else None,
-        "unique_input_footprints_after_osm_merge": len(unique_records),
-        "unique_input_counts_by_provider": source_counts,
-        "final_output_footprints": len(building_provenance),
-        "output_provenance": building_provenance,
-    }
+    footprint_summary = build_footprint_summary(
+        provider,
+        footprint_source,
+        footprint_paths,
+        min_confidence,
+        provider_records,
+        unique_records,
+        ortho_sources,
+        target_precision,
+        thresholds_path,
+        thresholds_source,
+    )
     legacy_provider_report = {}
     if provider_name == "microsoft":
         legacy_provider_report["microsoft"] = {
@@ -1150,6 +1202,14 @@ def build(args) -> dict:
             "merged_unique_input_footprints": len(unique_records),
         }
     attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}; reference aerial supplied by user."
+    threshold_warnings = []
+    if target_precision is not None:
+        threshold_warnings.append(
+            f"Google Open Buildings S2-cell confidence thresholds target an estimated {target_precision}% precision "
+            "tier; this is a dataset-published estimate, not a measured or guaranteed accuracy for this site, and "
+            "cells without a published value fall back to the standard minimum confidence cutoff."
+        )
+
     report = {
         "ok": qa["ok"],
         "findings": qa["findings"],
@@ -1231,13 +1291,15 @@ def build(args) -> dict:
             "Public Overpass endpoints were unavailable/empty during the data check; the OpenStreetMap API map-bbox XML extract was used and clipped to the 300 m radius.",
             "The east-side connector of the local road loop is partly interpreted beneath tree/shadow cover; verify against current orthophoto or survey.",
             f"{provider.name} footprints are machine-generated, and all inferred geometry is architecturally orthogonalized; check against a licensed cadastral survey before legal boundary use.",
+            *threshold_warnings,
         ],
     }
     (out_dir / "fond-de-plan-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Return the CLI parser; kept separate so flag contracts are testable offline."""
     p = argparse.ArgumentParser(description="Professional metric Fond de Plan export (SVG/DXF/PNG/PDF)")
     p.add_argument("--maps-url", help="Google Maps short URL to resolve")
     p.add_argument("--lat", type=float)
@@ -1262,7 +1324,18 @@ def main() -> int:
         "--google-min-confidence",
         type=float,
         default=0.65,
-        help="minimum Google Open Buildings score [0,1] (default: 0.65)",
+        help="baseline/fallback Google score threshold [0,1] (default: 0.65)",
+    )
+    p.add_argument(
+        "--google-target-precision",
+        type=int,
+        choices=(80, 85, 90),
+        default=None,
+        help="apply the matching Google S2-cell confidence threshold for estimated precision",
+    )
+    p.add_argument(
+        "--google-thresholds-path",
+        help="local/cached Google score-threshold CSV; otherwise it is downloaded and cached when target precision is set",
     )
     p.add_argument(
         "--google-max-download-mb",
@@ -1277,6 +1350,11 @@ def main() -> int:
         "--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet"
     )
     p.add_argument("--json", action="store_true", help="emit JSON report to stdout")
+    return p
+
+
+def main() -> int:
+    p = build_parser()
     a = p.parse_args()
     if a.layout_scale and not a.layout_sheet:
         p.error("--layout-scale requires --layout-sheet")

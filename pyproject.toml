@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cad-fond-de-plan"
-version = "1.4.2"
+version = "1.4.4"
 description = "Deterministic urban morphology and metric R2018 CAD engine for architectural site plans"
 readme = "DEVELOPMENT_ARCHITECTURE_MAP.md"
 requires-python = ">=3.10"

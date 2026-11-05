@@ -14,6 +14,7 @@ import json
 import math
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,11 +25,20 @@ from pyproj import Transformer
 from shapely import make_valid, wkt
 from shapely import transform as shapely_transform
 from shapely.errors import ShapelyError
-from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box, shape
+from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, box, shape
+from shapely.strtree import STRtree
 
 MS_INDEX = "https://bfppub.blob.core.windows.net/$web/2026-07-24/dataset-links.csv"
 OB_TILES_URL = "https://openbuildings-public-dot-gweb-research.uw.r.appspot.com/public/tiles.geojson"
+OB_SCORE_THRESHOLDS_URL = "https://storage.googleapis.com/open-buildings-data/v3/score_thresholds_s2_level_4.csv"
 OB_ATTRIBUTION = "Google Open Buildings v3 (CC BY 4.0 or ODbL 1.0)"
+RESOLUTION_BASELINE = "baseline-min-confidence"
+RESOLUTION_REGIONAL = "regional-s2-cell-threshold"
+RESOLUTION_CELL_MISSING_TIER = "fallback-cell-threshold-missing"
+RESOLUTION_NO_CELL_MATCH = "fallback-no-cell-match"
+RESOLUTION_TABLE_UNAVAILABLE = "fallback-threshold-table-unavailable"
+
+
 MS_ATTRIBUTION = "Microsoft Global ML Building Footprints (CDLA-Permissive-2.0)"
 OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 
@@ -83,6 +93,10 @@ class BaseFootprintProvider(abc.ABC):
         to_utm: Transformer,
         study_circle: Polygon,
         min_confidence: float | None = None,
+        *,
+        target_precision: int | None = None,
+        thresholds_path: Path | None = None,
+        thresholds_source: str | None = None,
     ) -> list[FootprintRecord]:
         """Parse, project, validate, and spatially clip source features."""
 
@@ -232,8 +246,12 @@ class MicrosoftFootprintProvider(BaseFootprintProvider):
         to_utm: Transformer,
         study_circle: Polygon,
         min_confidence: float | None = None,
+        *,
+        target_precision: int | None = None,
+        thresholds_path: Path | None = None,
+        thresholds_source: str | None = None,
     ) -> list[FootprintRecord]:
-        del min_confidence
+        del min_confidence, target_precision, thresholds_path, thresholds_source
         records: list[FootprintRecord] = []
         for path in paths:
             opener = gzip.open if path.suffix.lower() == ".gz" else open
@@ -264,6 +282,137 @@ class MicrosoftFootprintProvider(BaseFootprintProvider):
         return records
 
 
+@dataclass(frozen=True)
+class S2ConfidenceThreshold:
+    cell_id: str
+    geometry: Polygon
+    values: dict[int, float | None]
+
+
+class GoogleScoreThresholdTable:
+    """Spatial index over Google's S2-cell precision thresholds (WGS84 polygons)."""
+
+    def __init__(self, cells: list[S2ConfidenceThreshold], source: str):
+        self.cells = cells
+        self.source = source
+        self._geometries = [cell.geometry for cell in cells]
+        self._tree = STRtree(self._geometries) if self._geometries else None
+
+    @classmethod
+    def from_csv(cls, path: Path, source: str | None = None) -> GoogleScoreThresholdTable:
+        required = {
+            "s2_token",
+            "geometry",
+            "confidence_threshold_80%_precision",
+            "confidence_threshold_85%_precision",
+            "confidence_threshold_90%_precision",
+        }
+        cells: list[S2ConfidenceThreshold] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise ValueError(f"Threshold CSV needs columns {sorted(required)}")
+            for row in reader:
+                try:
+                    cell_id = (row.get("s2_token") or "").strip()
+                    geometry = wkt.loads(row.get("geometry", ""))
+                except (ShapelyError, TypeError, ValueError):
+                    continue
+                if not cell_id or geometry.is_empty:
+                    continue
+                values: dict[int, float | None] = {}
+                for precision in (80, 85, 90):
+                    raw = row.get(f"confidence_threshold_{precision}%_precision")
+                    try:
+                        value = float(raw) if raw not in (None, "") else math.nan
+                    except (TypeError, ValueError):
+                        value = math.nan
+                    values[precision] = value if math.isfinite(value) and 0 <= value <= 1 else None
+                cells.append(S2ConfidenceThreshold(cell_id, geometry, values))
+        return cls(cells, source or str(path))
+
+    def resolve(self, point: Point, precision: int) -> tuple[float | None, str | None, str]:
+        """Return (threshold, cell id, resolution source) for a WGS84 point."""
+        if self._tree is None:
+            return None, None, RESOLUTION_NO_CELL_MATCH
+        indices = self._tree.query(point)
+        matching = [self.cells[int(index)] for index in indices if self.cells[int(index)].geometry.covers(point)]
+        if not matching:
+            return None, None, RESOLUTION_NO_CELL_MATCH
+        # Normally cells are disjoint; for exact-boundary points choose the interior,
+        # then the smallest polygon, then lexical token for deterministic behavior.
+        matching.sort(key=lambda cell: (not cell.geometry.contains(point), cell.geometry.area, cell.cell_id))
+        cell = matching[0]
+        value = cell.values.get(precision)
+        if value is None:
+            return None, cell.cell_id, RESOLUTION_CELL_MISSING_TIER
+        return value, cell.cell_id, RESOLUTION_REGIONAL
+
+
+def threshold_provenance_report(
+    records: Iterable[FootprintRecord],
+    target_precision: int | None,
+    thresholds_path: Path | None,
+    thresholds_source: str,
+) -> dict[str, Any]:
+    """Build report-ready threshold policy plus per-source-feature threshold lineage."""
+    source_records = list(records)
+    resolution_counts: Counter[str] = Counter()
+    applied_thresholds: set[float] = set()
+    resolved_cells: set[str] = set()
+    per_feature: list[dict[str, Any]] = []
+    for record in source_records:
+        attributes = record.attributes
+        resolution = attributes.get("threshold_resolution_source", RESOLUTION_BASELINE)
+        resolution_counts[resolution] += 1
+        applied = attributes.get("applied_confidence_threshold")
+        if isinstance(applied, (int, float)) and not isinstance(applied, bool):
+            applied_thresholds.add(float(applied))
+        cell_id = attributes.get("s2_cell_id")
+        if cell_id:
+            resolved_cells.add(str(cell_id))
+        per_feature.append(
+            {
+                "source_id": record.source_id,
+                "confidence": record.confidence,
+                "applied_confidence_threshold": applied,
+                "target_precision": attributes.get("target_precision"),
+                "s2_cell_id": cell_id,
+                "threshold_resolution_source": resolution,
+            }
+        )
+    regional = resolution_counts.get(RESOLUTION_REGIONAL, 0)
+    if target_precision is None:
+        summary = "No precision target requested; every feature used the standard minimum confidence cutoff."
+    elif regional:
+        summary = (
+            f"{regional} of {len(source_records)} source footprints used the S2-cell threshold for the "
+            f"estimated {target_precision}% precision tier; the remainder fell back to the standard minimum confidence."
+        )
+    else:
+        summary = (
+            f"No S2-cell threshold was available for the estimated {target_precision}% precision tier; "
+            "every feature fell back to the standard minimum confidence."
+        )
+    return {
+        "target_precision": target_precision,
+        "precision_is_estimate": target_precision is not None,
+        "precision_note": (
+            "Google publishes these per-cell score thresholds as estimated precision tiers, "
+            "not as a guaranteed precision or accuracy statement."
+            if target_precision is not None
+            else "No regional precision target requested; the standard minimum confidence was used."
+        ),
+        "thresholds_csv_path": str(thresholds_path) if thresholds_path else None,
+        "thresholds_resolution_source": thresholds_source,
+        "threshold_resolution_summary": summary,
+        "threshold_resolution_counts": dict(sorted(resolution_counts.items())),
+        "applied_confidence_thresholds": sorted(applied_thresholds),
+        "resolved_s2_cell_ids": sorted(resolved_cells),
+        "source_feature_thresholds": per_feature,
+    }
+
+
 class GoogleOpenBuildingsProvider(BaseFootprintProvider):
     """Google Open Buildings v3 polygons with score and row-level provenance."""
 
@@ -288,6 +437,37 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
         if path.suffix.lower() not in {".csv", ".gz"}:
             raise ValueError("Google Open Buildings input must be a .csv, .csv.gz, or directory of tile files")
         return [path]
+
+    def acquire_thresholds(self, out_dir: Path, local_path: Path | None = None) -> tuple[Path | None, str]:
+        """Use an explicit/local cached thresholds CSV, otherwise download and cache it.
+
+        A failed automatic lookup is non-fatal: callers then apply the normal 0.65
+        baseline and record why regional resolution was unavailable.
+        """
+        if local_path is not None:
+            path = local_path.expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"Google score-threshold CSV does not exist: {path}")
+            return path, f"local-thresholds-csv:{path}"
+        cache_path = out_dir / "source" / "google-open-buildings-score-thresholds.csv"
+        if cache_path.is_file():
+            return cache_path, f"cached-thresholds-csv:{cache_path}"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            response = requests.get(
+                OB_SCORE_THRESHOLDS_URL,
+                timeout=120,
+                headers={"User-Agent": "cad-fond-de-plan/1.0"},
+            )
+            response.raise_for_status()
+            if len(response.content) > 100 * 1024 * 1024:
+                return None, "thresholds-download-exceeded-100-MB-safety-limit"
+            temp_path = cache_path.with_suffix(cache_path.suffix + ".part")
+            temp_path.write_bytes(response.content)
+            temp_path.replace(cache_path)
+            return cache_path, f"downloaded-thresholds-csv:{cache_path}"
+        except (requests.RequestException, OSError) as error:
+            return None, f"thresholds-unavailable:{type(error).__name__}"
 
     def acquire(
         self,
@@ -391,10 +571,24 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
         to_utm: Transformer,
         study_circle: Polygon,
         min_confidence: float | None = None,
+        *,
+        target_precision: int | None = None,
+        thresholds_path: Path | None = None,
+        thresholds_source: str | None = None,
     ) -> list[FootprintRecord]:
-        threshold = self.default_min_confidence if min_confidence is None else float(min_confidence)
-        if not 0.0 <= threshold <= 1.0:
+        baseline = self.default_min_confidence if min_confidence is None else float(min_confidence)
+        if not 0.0 <= baseline <= 1.0:
             raise ValueError("min_confidence must be between 0 and 1")
+        if target_precision not in (None, 80, 85, 90):
+            raise ValueError("target_precision must be None, 80, 85, or 90")
+        table_error = None
+        threshold_table = None
+        if target_precision is not None and thresholds_path is not None:
+            try:
+                threshold_table = GoogleScoreThresholdTable.from_csv(thresholds_path, thresholds_source)
+            except (OSError, ValueError) as error:
+                # A missing/invalid table must degrade to the baseline cutoff, never abort a build.
+                table_error = f"{type(error).__name__}: {error}"
         records: list[FootprintRecord] = []
         for path in paths:
             opener = gzip.open if path.suffix.lower() == ".gz" else open
@@ -408,15 +602,42 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
                     )
                 for row_number, row in enumerate(reader, 2):
                     score = _confidence(row.get("confidence"))
-                    if score is None or score < threshold:
+                    if score is None:
                         continue
                     try:
                         geometry = wkt.loads(row.get("geometry", ""))
                     except (ShapelyError, TypeError, ValueError):
                         continue
+                    applied_threshold = baseline
+                    s2_cell_id = None
+                    regional_value = None
+                    if target_precision is None:
+                        resolution_source = RESOLUTION_BASELINE
+                    elif threshold_table is None:
+                        resolution_source = RESOLUTION_TABLE_UNAVAILABLE
+                    else:
+                        regional_value, s2_cell_id, resolution_source = threshold_table.resolve(
+                            geometry.centroid, target_precision
+                        )
+                    if regional_value is not None:
+                        applied_threshold = regional_value
+                    if score < applied_threshold:
+                        continue
+
                     plus_code = (row.get("full_plus_code") or "").strip()
                     source_id = f"{path.name}:row-{row_number}"
-                    attributes: dict[str, Any] = {"tile_file": path.name, "row": row_number}
+                    attributes: dict[str, Any] = {
+                        "tile_file": path.name,
+                        "row": row_number,
+                        "applied_confidence_threshold": applied_threshold,
+                        "target_precision": target_precision,
+                        "s2_cell_id": s2_cell_id,
+                        "threshold_resolution_source": resolution_source,
+                    }
+                    if thresholds_source:
+                        attributes["threshold_table_source"] = thresholds_source
+                    if table_error:
+                        attributes["threshold_table_error"] = table_error
                     if plus_code:
                         attributes["full_plus_code"] = plus_code
                     try:

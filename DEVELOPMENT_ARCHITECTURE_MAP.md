@@ -1,7 +1,7 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.4.2  
-**Last updated:** 2026-11-04  
+**Current release:** 1.4.4  
+**Last updated:** 2026-11-05  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
 
@@ -75,6 +75,14 @@ The aspect-ratio expected failure was removed. The recorded phase-level result w
 Release **1.4.1** adds block-level shared-wall midpoint snapping, adjacency/face extraction, courtyard dimension diagnostics, a level-aware road-centerline graph, width-aware curb synthesis, and near-curb parcel-frontage reconciliation. R2018 DXF output now has a CTB-ready monochrome layer schema, reusable paper-space grid-cross/north-arrow blocks, and optional A3/A1/A0 layouts. The layout engine resolves the fixed 180 × 50 mm DIN-style vector cartouche, UTM/WGS84/area fields, grid annotations, and a true-distance scale bar.
 
 The phase-4 regression suite uses synthetic geometry and a temporary DXF only. Final recorded result: **30 passed**. No production generation, rendering, or site-plan export was run for this upgrade. The validated historical A3 files were preserved.
+
+### Phase 5 — Provider lineage and region-aware confidence filtering
+
+Release **1.4.3** introduced the opt-in Google Open Buildings v3 provider (`--footprint-provider google-open-buildings`) with offline cached-tile support, score retention, and per-footprint provenance.
+
+Release **1.4.4** adds region-aware confidence filtering. Google publishes per-S2-level-4-cell score thresholds for estimated 80%, 85%, and 90% precision tiers; the provider indexes those cell polygons with a Shapely `STRtree` and resolves each footprint centroid against them. `--google-target-precision [80|85|90]` (default `None`) selects the tier and `--google-thresholds-path` supplies a local/cached thresholds CSV, so resolution can run fully offline.
+
+Fallback is explicit and never fatal: no covering cell, a cell missing the requested tier, or an unusable/absent table all revert to the baseline `0.65` minimum confidence with a distinct `threshold_resolution_source` label. Applied threshold, target tier, S2 cell ID, and resolution source are recorded on each source footprint and aggregated in the report (`footprints` section) along with a note that the tier is a dataset-published estimate rather than a measured accuracy. Offline fixtures and unit tests cover exact cell match, tier-dependent filtering, missing-value fallback, out-of-cell fallback, invalid precision, unreadable/missing threshold files, cached reuse, and report provenance.
 
 ---
 
@@ -225,10 +233,10 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.4.2**.
+- Skill/manifest version: **1.4.4**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
-- Latest full regression run: **30 passed**; Python compilation and JSON parsing passed.
+- Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.
 - Validated A3 artifacts are protected and remain in `/home/user/site-plan/`.
 - Full generation/render/export was intentionally not run during this engineering upgrade.
 - Quota recovery left `/home/user` at **378 files / 43M** (target: <500 files / <100MB); filesystem use is 17%. The validated A3 SVG/PDF and all critical skill source remain. At the pre-cleanup inventory, only the A3 SVG and PDF were present; no A3 300-dpi PNG existed in `site-plan`, and none was removed.
