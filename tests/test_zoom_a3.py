@@ -1,14 +1,15 @@
 import importlib.util
-import math
 import unittest
-from pathlib import Path
 import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from shapely.geometry import Polygon
 
 TOOL = Path(__file__).resolve().parents[1] / "tools" / "cad-fond-de-plan-zoom-a3.py"
 spec = importlib.util.spec_from_file_location("zoom_a3", TOOL)
+assert spec is not None and spec.loader is not None
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-from shapely.geometry import Polygon
 
 
 class ReadOnlyA3Layout(unittest.TestCase):
@@ -34,7 +35,7 @@ class ReadOnlyA3Layout(unittest.TestCase):
     def test_hatch_spacing_is_compensated_for_zoom(self):
         _, _, _, _, zoom = mod.crop_window(0, 0)
         pitch = mod.PAPER_HATCH_MM / zoom
-        poly = Polygon([(0,0),(12,0),(12,9),(0,9)], holes=[[(4,3),(8,3),(8,6),(4,6)]])
+        poly = Polygon([(0, 0), (12, 0), (12, 9), (0, 9)], holes=[[(4, 3), (8, 3), (8, 6), (4, 6)]])
         lines = mod.hatch_lines(poly, pitch)
         self.assertTrue(lines)
         self.assertTrue(all(poly.buffer(1e-8).covers(line) for line in lines))
@@ -42,7 +43,7 @@ class ReadOnlyA3Layout(unittest.TestCase):
 
     def test_paper_strokes_are_compensated_not_restyled(self):
         _, _, _, _, zoom = mod.crop_window(0, 0)
-        g = ET.Element("g", {"stroke-width":"0.50", "stroke-dasharray":"4 2"})
+        g = ET.Element("g", {"stroke-width": "0.50", "stroke-dasharray": "4 2"})
         mod.scale_paper_strokes(g, zoom)
         self.assertAlmostEqual(float(g.attrib["stroke-width"]) * zoom, 0.50, places=6)
         values = [float(x) for x in g.attrib["stroke-dasharray"].split()]

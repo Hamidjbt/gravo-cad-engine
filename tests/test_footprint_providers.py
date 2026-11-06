@@ -1,4 +1,5 @@
 """Offline regression coverage for footprint provider parsing and lineage."""
+
 from __future__ import annotations
 
 import gzip
@@ -110,8 +111,11 @@ def test_microsoft_remains_factory_default_and_reads_cached_geojsonl(tmp_path):
     to_utm, study_circle = _projection_and_study_circle()
     lon, lat = -0.641, 35.7
     coordinates = [
-        [lon, lat], [lon + 0.0001, lat], [lon + 0.0001, lat + 0.0001],
-        [lon, lat + 0.0001], [lon, lat],
+        [lon, lat],
+        [lon + 0.0001, lat],
+        [lon + 0.0001, lat + 0.0001],
+        [lon, lat + 0.0001],
+        [lon, lat],
     ]
     feature = {
         "type": "Feature",
@@ -186,7 +190,9 @@ def test_precision_tier_changes_the_applied_cutoff():
     tightened = _records_at([FIXTURE], target_precision=90, thresholds_path=THRESHOLDS_FIXTURE)
     assert [record.confidence for record in loosened] == [0.93, 0.60, 0.99]
     assert [record.confidence for record in tightened] == [0.93, 0.99]
-    assert {record.attributes["applied_confidence_threshold"] for record in loosened if record.confidence == 0.60} == {0.55}
+    assert {record.attributes["applied_confidence_threshold"] for record in loosened if record.confidence == 0.60} == {
+        0.55
+    }
     assert 0.90 in {record.attributes["applied_confidence_threshold"] for record in tightened}
 
 

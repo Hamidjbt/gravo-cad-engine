@@ -1,4 +1,5 @@
 """Fast geometry-only regression tests for the precision audit; no render/export calls."""
+
 import importlib.util
 import math
 import unittest
@@ -18,13 +19,12 @@ spec.loader.exec_module(mod)
 class PrecisionEdgeCases(unittest.TestCase):
     def test_oblique_vernacular_l_shape_keeps_its_local_axis_and_concavity(self):
         theta = math.radians(23.0)
-        source = rotate(Polygon([(0, 0), (12, 0), (12, 4), (4, 4), (4, 10), (0, 10)]),
-                        23.0, origin=(0, 0))
+        source = rotate(Polygon([(0, 0), (12, 0), (12, 4), (4, 4), (4, 10), (0, 10)]), 23.0, origin=(0, 0))
         result, fallback = mod.orthogonalize(source, theta, min_segment=1.2)
         self.assertFalse(fallback)
         self.assertAlmostEqual(result.area, source.area, places=6)
         self.assertEqual(len(result.exterior.coords), len(source.exterior.coords))
-        for a, b in zip(result.exterior.coords, list(result.exterior.coords)[1:]):
+        for a, b in zip(result.exterior.coords, list(result.exterior.coords)[1:], strict=False):
             if math.dist(a, b) > 1e-8:
                 edge_angle = math.atan2(b[1] - a[1], b[0] - a[0])
                 self.assertLess(abs(math.sin(2.0 * (edge_angle - theta))), 1e-7)
@@ -69,8 +69,7 @@ class PrecisionEdgeCases(unittest.TestCase):
         self.assertLessEqual(abs(snapped_aspect - aspect) / aspect, 0.05)
 
         horizontal = Polygon([(0, 0), (16, 0), (16, 3), (0, 3)])
-        oblique = rotate(Polygon([(8, 5), (24, 5), (24, 8), (8, 8)]),
-                         30.0, origin=(8, 5))
+        oblique = rotate(Polygon([(8, 5), (24, 5), (24, 8), (8, 8)]), 30.0, origin=(8, 5))
         axes = mod.building_axes([horizontal, oblique], radius_m=35.0)
         self.assertLess(mod.axial_difference(axes[0], 0.0), math.radians(1.0))
         self.assertLess(mod.axial_difference(axes[1], math.radians(30.0)), math.radians(1.0))
@@ -78,24 +77,26 @@ class PrecisionEdgeCases(unittest.TestCase):
     def _manual_casement(self, roads):
         empty_osm = gpd.GeoDataFrame(geometry=[], crs="EPSG:32630")
         identity = Transformer.from_crs(32630, 32630, always_xy=True)
-        return mod.road_casements(
-            empty_osm, identity, box(-50, -50, 50, 50), 0.0, 0.0, roads
-        )
+        return mod.road_casements(empty_osm, identity, box(-50, -50, 50, 50), 0.0, 0.0, roads)
 
     def test_acute_t_junction_casing_is_valid_and_single_component(self):
-        casing, osm_count, manual_count = self._manual_casement([
-            (LineString([(-20, 0), (20, 0)]), 8.0),
-            (LineString([(0, 0), (20, 4.2)]), 5.0),  # 12-degree branch into the trunk
-        ])
+        casing, osm_count, manual_count = self._manual_casement(
+            [
+                (LineString([(-20, 0), (20, 0)]), 8.0),
+                (LineString([(0, 0), (20, 4.2)]), 5.0),  # 12-degree branch into the trunk
+            ]
+        )
         self.assertEqual(osm_count, 0)
         self.assertEqual(manual_count, 2)
         self.assertTrue(casing.is_valid)
         self.assertEqual(len(mod.flatten_polygons(casing)), 1)
 
     def test_dead_end_uses_flat_terminus_at_centerline_endpoint(self):
-        casing, _, _ = self._manual_casement([
-            (LineString([(0, 0), (10, 0)]), 4.0),
-        ])
+        casing, _, _ = self._manual_casement(
+            [
+                (LineString([(0, 0), (10, 0)]), 4.0),
+            ]
+        )
         self.assertTrue(casing.is_valid)
         self.assertEqual(tuple(round(v, 6) for v in casing.bounds), (0.0, -2.0, 10.0, 2.0))
 

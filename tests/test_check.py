@@ -1,14 +1,15 @@
-import json, subprocess, sys, unittest
+import subprocess
+import sys
+import unittest
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
-TOOL = SKILL / 'tools/check.py'
+TOOL = SKILL / "tools/check.py"
 
 
 class ToolSmoke(unittest.TestCase):
     def run_tool(self, *args):
-        return subprocess.run([sys.executable, str(TOOL), *args],
-                              capture_output=True, text=True, timeout=30)
+        return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, timeout=30)
 
     def test_help(self):
         self.assertEqual(self.run_tool("--help").returncode, 0)

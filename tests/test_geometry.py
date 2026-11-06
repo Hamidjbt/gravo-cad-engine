@@ -1,16 +1,17 @@
-import math
+import importlib.util
 import sys
 import unittest
 from pathlib import Path
 
+from shapely.geometry import Polygon
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import importlib.util
 
 TOOL = Path(__file__).resolve().parents[1] / "tools" / "cad-fond-de-plan-build.py"
 spec = importlib.util.spec_from_file_location("fond_build", TOOL)
+assert spec is not None and spec.loader is not None
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-from shapely.geometry import Polygon
 
 
 class MetricAndOrthogonalization(unittest.TestCase):
@@ -27,8 +28,7 @@ class MetricAndOrthogonalization(unittest.TestCase):
         self.assertGreaterEqual(aspect, 1.0)
 
     def test_courtyard_hole_survives_orthogonalization(self):
-        poly = Polygon([(0, 0), (12, 0), (12, 10), (0, 10)],
-                       holes=[[(3, 3), (3, 7), (8, 7), (8, 3)]])
+        poly = Polygon([(0, 0), (12, 0), (12, 10), (0, 10)], holes=[[(3, 3), (3, 7), (8, 7), (8, 3)]])
         out, _ = mod.orthogonalize(poly, 0.0)
         self.assertEqual(len(out.interiors), 1)
         self.assertAlmostEqual(out.area, 100.0, places=4)
@@ -46,12 +46,13 @@ class MetricAndOrthogonalization(unittest.TestCase):
         self.assertLess(abs(axes[1]), 1e-6)
 
     def test_hatching_is_clipped_to_polygon_and_hole(self):
-        poly = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)],
-                       holes=[[(4, 4), (6, 4), (6, 6), (4, 6)]])
+        poly = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], holes=[[(4, 4), (6, 4), (6, 6), (4, 6)]])
         lines = mod.line_hatches(poly, 1.0)
         self.assertTrue(lines)
         self.assertTrue(all(poly.buffer(1e-8).covers(line) for line in lines))
-        self.assertTrue(all(line.intersection(Polygon([(4,4),(6,4),(6,6),(4,6)])).length < 1e-7 for line in lines))
+        self.assertTrue(
+            all(line.intersection(Polygon([(4, 4), (6, 4), (6, 6), (4, 6)])).length < 1e-7 for line in lines)
+        )
 
     def test_photo_anchor_maps_exactly_to_center_coordinate(self):
         p = mod.pixel_to_world((493, 680), 655840.064214, 3860557.983806, (493, 680), 0.12)
