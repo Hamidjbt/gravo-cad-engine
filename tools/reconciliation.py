@@ -154,6 +154,10 @@ class Classification:
     def is_containment(self) -> bool:
         return self.kind == CLASS_CONTAINMENT
 
+    @property
+    def is_distinct(self) -> bool:
+        return self.kind == CLASS_DISTINCT
+
     def to_dict(self) -> dict[str, Any]:
         return {"class": self.kind, "direction": self.direction, **self.metrics.to_dict()}
 
@@ -286,6 +290,7 @@ class ReconciliationLog:
     authoritative_contained_dropped: int = 0
     inferred_retained_over_authoritative: int = 0
     contains_authoritative_tags: list[str] = field(default_factory=list)
+    protected_from_absorption: list[str] = field(default_factory=list)
 
     def add(self, record: ReconciliationRecord) -> None:
         """Fold one pair decision into the counters.
@@ -330,6 +335,7 @@ class ReconciliationLog:
             "authoritative_contained_dropped": self.authoritative_contained_dropped,
             "inferred_retained_over_authoritative": self.inferred_retained_over_authoritative,
             "contains_authoritative_tags": sorted(self.contains_authoritative_tags),
+            "authoritative_protected_from_absorption": sorted(self.protected_from_absorption),
             "record_count": len(self.records),
         }
 

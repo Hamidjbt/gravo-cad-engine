@@ -74,11 +74,20 @@ class ExpectedLayoutResolver:
 
     @classmethod
     def from_report(cls, report: dict[str, Any] | None) -> frozenset[str]:
+        """Layouts this artifact set must contain, according to its own report.
+
+        An explicit ``paper_layouts.sheets`` declaration is authoritative. A report
+        that declares none is a layout-less run: it must not be judged against the
+        legacy A3/A1/A0 set, which it never emits. D3 — the builder and
+        ``tools/check.py`` previously reached opposite verdicts on identical output
+        because the builder disabled the assertion with an empty set while the
+        checker demanded the full legacy set.
+        """
         if not report:
             return ALL_LAYOUTS
         declared = (report.get("paper_layouts") or {}).get("sheets") or []
         if not declared:
-            return ALL_LAYOUTS
+            return frozenset()
         return frozenset(cls.sheet_label_to_layout(str(label)) for label in declared)
 
     @classmethod
@@ -178,7 +187,7 @@ def qa_dxf_file(path: Path, expected_layouts: frozenset[str] | None = None) -> d
                 )
         layouts = sorted(layout.name for layout in doc.layouts if layout.name != "Model")
         expected = ALL_LAYOUTS if expected_layouts is None else expected_layouts
-        if not layouts:
+        if not layouts and not expected:
             findings.append("No paper-space layout tabs found")
         elif not expected.issubset(set(layouts)):
             findings.append(f"DXF paper layouts incomplete: found {sorted(layouts)}, expected {sorted(expected)}")

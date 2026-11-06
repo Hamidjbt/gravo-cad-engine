@@ -377,15 +377,37 @@ def merge_footprint_records(
 
     # -- phase B: dedup / containment among the merged set ------------------
     merged.sort(key=lambda record: (-record.geometry.area, record.provider, record.source_id))
+    authoritative_ids = {record.source_id for record in authoritative_records}
     retain_all = dedup_window is None or dedup_window <= 0
     counters.bounded_window = None if retain_all else int(dedup_window)
     counters.index_filtered = True
     index = _OverlapIndex(envelope_padding_ratio)
     max_rank = None if retain_all else int(dedup_window)
     for candidate in merged:
+        # D1: authority is an invariant, not a phase. A record present in the
+        # authoritative input set can never be removed by a containment policy, so
+        # phase B resolves it against its neighbours for the record only and always
+        # retains it. Without this, ABSORB deleted real OSM buildings while
+        # reporting a clean audit.
+        protected = candidate.source_id in authoritative_ids
         match, compared, skipped = index.nearest_match(candidate, policy, max_rank)
         counters.candidates_compared += compared
         counters.candidates_skipped_by_index += skipped
+        if protected:
+            if match is not None and match.classification is not None and not match.classification.is_distinct:
+                if match.classification.is_containment:
+                    log.protected_from_absorption.append(candidate.source_id)
+                _log_pair(
+                    log,
+                    "dedup",
+                    candidate,
+                    match.known,
+                    match.classification,
+                    None,
+                    _protected_reason(match),
+                )
+            index.add(candidate)
+            continue
         if match is not None and match.drop:
             if match.classification.is_duplicate:
                 counters.dropped_as_duplicate += 1
@@ -408,6 +430,13 @@ class _Resolution:
     known: FootprintRecord | None = None
     contains_authoritative: bool = False
     contained_ids: tuple[str, ...] = ()
+
+
+def _protected_reason(match: _Resolution) -> str:
+    """Explain why an authoritative record survived a policy that would remove it."""
+    if match.classification is not None and match.classification.is_duplicate:
+        return "authoritative record protected: duplicate outlines never remove an authoritative footprint"
+    return "authoritative record protected: containment policy never removes an authoritative footprint"
 
 
 def _log_pair(

@@ -1,6 +1,6 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.8.0  
+**Current release:** 1.8.1  
 **Last updated:** 2026-11-06  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
@@ -160,6 +160,38 @@ exposed on the CLI; MCP `generate_cad_plan` forwards `containment_policy` and re
 `nested_pairs_reported`. `footprints.reconciliation.audit.consistent` asserts that every drop counted
 by deduplication carries a reconciliation record.
 
+### Phase 10 — Live trial, authoritative invariant, storage hygiene (1.8.1)
+
+v1.8.0 was validated end-to-end for the first time against live providers at Tlemcen
+(34.884528, −1.301250, R = 300 m): 274 Microsoft footprints + 14 OSM buildings → 286 output
+footprints in 39.6 s. The geometry, deduplication and reconciliation paths behaved as designed —
+three nestings retained and reported, zero absorbed, `audit.consistent: true`.
+
+The trial also found four defects that unit tests could not have caught, because none of them had
+ever been exercised:
+
+- **D1 data loss.** `absorb` deleted authoritative OSM buildings (14 → 11). Phase B applies the
+  containment policy to the merged set, which includes the authoritative records phase A protects.
+  The loss was logged as `absorbed`, so the audit stayed clean — a false negative in the very
+  mechanism built to prevent silent deletion. **Fixed** by making authority an invariant: no policy
+  may remove an authoritative record, and attempts are recorded in
+  `authoritative_protected_from_absorption`.
+- **D2 crash.** A run without `--image` has no site polygon, so `metadata_from_utm` called
+  `float(None)` on the ground area and aborted the build after acquisition. **Fixed**; the cartouche
+  already had a "NOT SPECIFIED" branch.
+- **D3 divergent verdicts.** The builder passed `expected_layouts=frozenset(())`, which made the
+  DXF layout assertion vacuously true, while `tools/check.py` demanded the legacy A3/A1/A0 set on
+  the same directory. One artifact set must not have two verdicts. **Fixed**: a report declaring no
+  layouts declares an expectation of none, and both callers apply it.
+- **D4 false provenance.** The report claimed a "manual vector trace from supplied aerial" and
+  attributed a user-supplied aerial when none was given, plus warnings for a JPEG that did not exist.
+  **Fixed**: every provenance clause and warning is now conditional on the event it describes.
+
+Phase 10 also adds `tools/workspace_hygiene.py` and a three-tier storage protocol (protected /
+disposable / retained), with `make clean`, `make hygiene-report` and `make hygiene-check`. Scratch
+space moves to `/var/tmp`. The governing rule is that the only things ever deleted are those that
+can be regenerated.
+
 ---
 
 ## 3. System architecture and modules
@@ -309,7 +341,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.8.0**.
+- Skill/manifest version: **1.8.1**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.

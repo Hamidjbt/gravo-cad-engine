@@ -113,7 +113,10 @@ def metadata_from_utm(
         "title": title,
         "utm": {"epsg": f"EPSG:{int(epsg)}", "easting_m": float(easting_m), "northing_m": float(northing_m)},
         "wgs84": {"latitude": float(lat), "longitude": float(lon)},
-        "ground_area_m2": float(ground_area_m2),
+        # D2: a run without --image has no site polygon, so there is no ground
+        # area to state. cartouche_text already renders "NOT SPECIFIED" for None;
+        # only this line used to crash the whole build with a bare TypeError.
+        "ground_area_m2": float(ground_area_m2) if ground_area_m2 is not None else None,
     }
 
 

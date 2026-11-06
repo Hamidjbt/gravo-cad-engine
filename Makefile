@@ -1,7 +1,8 @@
 PYTHON ?= python3
-TMP_ROOT ?= /tmp
+# Scratch space must never be the bounded /tmp tmpfs.
+TMP_ROOT ?= /var/tmp
 
-.PHONY: test lint build run-mcp clean
+.PHONY: test lint build run-mcp clean hygiene-report hygiene-check
 
 test:
 	@set -eu; tmp="$$(mktemp -d "$(TMP_ROOT)/cad-fond-test.XXXXXX")"; trap 'rm -rf "$$tmp"' EXIT; \
@@ -14,11 +15,11 @@ lint:
 	@set -eu; tmp="$$(mktemp -d "$(TMP_ROOT)/cad-fond-lint.XXXXXX")"; trap 'rm -rf "$$tmp"' EXIT; \
 	$(PYTHON) -m venv "$$tmp/venv"; \
 	PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$$tmp/venv/bin/python" -m pip install --no-cache-dir ruff==0.17.3 mypy==2.4.1; \
-	"$$tmp/venv/bin/ruff" check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/reconciliation.py tools/check.py tests; \
-	"$$tmp/venv/bin/ruff" format --check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/reconciliation.py tools/check.py tests; \
+	"$$tmp/venv/bin/ruff" check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/reconciliation.py tools/workspace_hygiene.py tools/check.py tests; \
+	"$$tmp/venv/bin/ruff" format --check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/reconciliation.py tools/workspace_hygiene.py tools/check.py tests; \
 	"$$tmp/venv/bin/mypy" server/mcp_server.py
 
-build:
+build: clean
 	@set -eu; tmp="$$(mktemp -d "$(TMP_ROOT)/cad-fond-build.XXXXXX")"; trap 'rm -rf "$$tmp"' EXIT; \
 	$(PYTHON) -m venv "$$tmp/venv"; \
 	PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$$tmp/venv/bin/python" -m pip install --no-cache-dir build==1.3.0; \
@@ -27,5 +28,12 @@ build:
 run-mcp:
 	uv run --project . python -m server.mcp_server
 
-clean:
-	rm -rf build dist *.egg-info .pytest_cache .mypy_cache .ruff_cache
+clean: ## remove regenerable caches and scratch virtualenvs (evidence is preserved)
+	@$(PYTHON) tools/workspace_hygiene.py prune
+	-@find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+hygiene-report: ## show what is on disk, by tier
+	@$(PYTHON) tools/workspace_hygiene.py report
+
+hygiene-check: ## fail if regenerable clutter is present
+	@$(PYTHON) tools/workspace_hygiene.py check

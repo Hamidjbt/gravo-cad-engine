@@ -48,7 +48,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.8.0"
+ENGINE_VERSION = "1.8.1"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -899,7 +899,9 @@ def qa_outputs(
     result = qa_output_directory(
         out_dir,
         include_report=False,
-        expected_layouts=frozenset(expected_layouts or ()),
+        # Not `or ()`: an empty declaration is a real expectation (none), not a
+        # request to fall back to the legacy A3/A1/A0 set (D3).
+        expected_layouts=frozenset(expected_layouts or []),
         expected_png_px=expected_px,
     )
     findings = [finding for finding in result["findings"] if not finding.startswith("missing deliverable:")]
@@ -1188,6 +1190,9 @@ def build(args) -> dict:
         else []
     )
     expected_layout_names = [label.replace(" ", "-").replace(":", "_") for label in layout_sheets]
+    # D3: pass the same declaration the report will carry, so the builder and
+    # tools/check.py cannot reach opposite verdicts on the same artifact set. A
+    # layout-less run declares no sheets and therefore expects none.
     qa = qa_outputs(
         out_dir,
         len(buildings),
@@ -1218,7 +1223,9 @@ def build(args) -> dict:
             "footprints_intersecting_300m_before_dedup": len(provider_records),
             "merged_unique_input_footprints": len(unique_records),
         }
-    attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}; reference aerial supplied by user."
+    attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}"
+    if image_path:
+        attribution += "; reference aerial supplied by user."
     threshold_warnings = []
     if target_precision is not None:
         threshold_warnings.append(
@@ -1288,7 +1295,13 @@ def build(args) -> dict:
             "grid_spacing_m": "50 (A3/A1), 100 (A0)",
         },
         "site_boundary": {
-            "source": "manual vector trace from supplied aerial; inferred parcel edge where vegetation obscures curb",
+            # D4: a run without --image has no supplied aerial and no manual trace;
+            # saying otherwise in a print deliverable is a false provenance claim.
+            "source": (
+                "manual vector trace from supplied aerial; inferred parcel edge where vegetation obscures curb"
+                if image_path
+                else "not traced: no reference aerial supplied, site limited to the study radius"
+            ),
             "area_m2": round(site.area, 1) if not site.is_empty else None,
         },
         "outputs": {
@@ -1323,17 +1336,52 @@ def build(args) -> dict:
         ),
         "qa": qa,
         "attribution": attribution,
-        "warnings": [
-            f"Reference JPEG has no EXIF geotags/scale; image georeferencing is an estimated {gsd:g} m/px alignment to the map pin and {provider.name} footprints, not survey-grade.",
-            "Public Overpass endpoints were unavailable/empty during the data check; the OpenStreetMap API map-bbox XML extract was used and clipped to the 300 m radius.",
-            "The east-side connector of the local road loop is partly interpreted beneath tree/shadow cover; verify against current orthophoto or survey.",
-            f"{provider.name} footprints are machine-generated, and all inferred geometry is architecturally orthogonalized; check against a licensed cadastral survey before legal boundary use.",
-            *threshold_warnings,
-        ],
+        "warnings": [*build_warnings(image_path, gsd, provider, osm_method, threshold_warnings)],
     }
     report = apply_detail(report, getattr(args, "report_detail", DEFAULT_REPORT_DETAIL))
     (out_dir / "fond-de-plan-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def build_warnings(
+    image_path: Path | None,
+    gsd: float,
+    provider,
+    osm_method: str,
+    threshold_warnings: list[str],
+) -> list[str]:
+    """Warnings that describe what this run actually did.
+
+    D4: every clause is conditional on the event it describes. A warning claiming a
+    reference aerial, an Overpass fallback, or a manual road trace that did not
+    happen is a false provenance statement in a printed deliverable.
+    """
+    warnings: list[str] = []
+    if image_path:
+        warnings.append(
+            f"Reference JPEG has no EXIF geotags/scale; image georeferencing is an estimated {gsd:g} m/px "
+            f"alignment to the map pin and {provider.name} footprints, not survey-grade."
+        )
+        warnings.append(
+            "Roads and parcels traced from the supplied aerial are visually interpreted; verify against "
+            "current orthophoto or survey where cover is partial."
+        )
+    else:
+        warnings.append(
+            "No reference aerial supplied: no manually traced roads, parcels or site boundary are present; "
+            "geometry is derived from OSM and the building-footprint provider alone."
+        )
+    if osm_method != "overpass":
+        warnings.append(
+            "Public Overpass endpoints were unavailable/empty during the data check; the OpenStreetMap API "
+            "map-bbox XML extract was used and clipped to the study radius."
+        )
+    warnings.append(
+        f"{provider.name} footprints are machine-generated, and all inferred geometry is architecturally "
+        "orthogonalized; check against a licensed cadastral survey before legal boundary use."
+    )
+    warnings.extend(threshold_warnings)
+    return warnings
 
 
 def build_parser() -> argparse.ArgumentParser:

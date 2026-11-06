@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.8.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.8.1. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,39 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## Authoritative invariant (v1.8.1)
+
+A live trial against real Tlemcen data found that `--containment-policy absorb` deleted authoritative
+OpenStreetMap buildings: 14 in, 11 out. Phase B runs over the merged set and applied the containment
+policy to the authoritative records phase A had just protected, logging the loss as `absorbed` rather
+than `authoritative_contained_dropped` — so the audit still reported `consistent: true`.
+
+Authority is now an **invariant, not a phase**. A record present in the authoritative input set can
+never be removed by any containment policy; when a policy would have removed it, the pair is recorded
+with `decision: retained` and a stated reason, and the record is listed in
+`authoritative_protected_from_absorption`. `absorb` still absorbs inferred footprints, so the policy
+is not neutered — it simply cannot reach authoritative data.
+
+Also in 1.8.1: `metadata_from_utm` accepts an absent ground area (a run without `--image` no longer
+crashes with a bare `TypeError`), the builder and `tools/check.py` share one layout expectation, and
+attribution/warnings only claim a user-supplied aerial when one was actually supplied.
+
+## Workspace hygiene (v1.8.1)
+
+`tools/workspace_hygiene.py` keeps the workspace small without ever risking evidence. Classification
+is by **class, not age**, in three tiers:
+
+| tier | contents | action |
+|---|---|---|
+| protected | `.git`, source trees, `tests/`, bundles, architecture maps, deliverables (`site-plan/`), user uploads, installer scripts | never removed |
+| disposable | `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `build/`, `dist/`, `*.egg-info`, stray scratch virtualenvs | removed by `make clean` |
+| retained | downloaded tiles and run outputs | kept unless `--include-data` **and** older than `--max-age-days` |
+
+Protection is decided by the innermost path component, so `tools/__pycache__` is prunable while
+`tools/` is not. Scratch space is standardised on `/var/tmp` (`TMP_ROOT ?= /var/tmp`), keeping
+temporary operations off the bounded `/tmp` tmpfs, and `make build` depends on `make clean` so
+packaging always starts from a clean tree.
 
 ## Containment policy (v1.8.0)
 

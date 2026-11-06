@@ -2,7 +2,7 @@
 name: cad-fond-de-plan
 description: "Use when creating a metric monochrome Fond de Plan from OSM, Microsoft footprints, or a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms."
 metadata:
-  version: "1.8.0"
+  version: "1.8.1"
   tags: "geospatial, gis, cad, dxf, osm, urban-planning"
   triggers: "fond de plan, cadastral base map, building footprints to DXF, road casement, architectural site plan"
 ---
@@ -51,6 +51,7 @@ Ask for the map link or coordinates, radius/extent, aerial image, any surveyed/G
 - `tools/urban_topology.py`: deterministic block, courtyard, road-graph, curb, and frontage helpers.
 - `tools/layout_engine.py`: A3/A1/A0 scale/viewport resolver and vector paper-space annotations.
 - `tools/cad-fond-de-plan-zoom-a3.py`: read-only A3 viewport exporter; `tools/a3_layout_exporter.py` is its portable CLI alias.
+- `tools/workspace_hygiene.py`: three-tier storage protocol (protected / disposable / retained); `make clean` prunes only regenerable caches and throwaway virtualenvs, and never touches source, tests, bundles or deliverables.
 - `tools/check.py DIR`: deterministic package QA; `tools/cad-fond-de-plan-setup.sh`: isolated dependency setup.
 - `tests/`: fast geometry, QA, and layout regression tests; run `pytest -q` from the skill root. Tests do not call the full render pipeline.
 

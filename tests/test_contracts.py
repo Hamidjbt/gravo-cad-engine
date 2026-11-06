@@ -336,3 +336,120 @@ def test_mcp_topology_rejects_paths_outside_allowed_root(tmp_path, monkeypatch):
     outside = ROOT / "pyproject.toml"
     with pytest.raises(ValueError, match="allowed root"):
         mcp_server.verify_topology(str(outside))
+
+
+# --- v1.8.1: D2 metadata tolerates an absent site area ----------------------
+
+
+def test_metadata_from_utm_accepts_a_missing_ground_area():
+    """D2: a run without --image has no site polygon and used to crash with TypeError."""
+    import layout_engine
+
+    metadata = layout_engine.metadata_from_utm(655239.131, 3861554.193, 32630, None)
+    assert metadata["ground_area_m2"] is None
+    assert metadata["utm"]["epsg"] == "EPSG:32630"
+    assert 34.8 < metadata["wgs84"]["latitude"] < 34.9
+
+
+def test_metadata_from_utm_still_reports_a_real_area():
+    import layout_engine
+
+    metadata = layout_engine.metadata_from_utm(655239.131, 3861554.193, 32630, 1234.5)
+    assert metadata["ground_area_m2"] == pytest.approx(1234.5)
+
+
+def test_cartouche_renders_not_specified_without_an_area():
+    import layout_engine
+
+    text = layout_engine.cartouche_text(layout_engine.metadata_from_utm(655239.131, 3861554.193, 32630, None), 500)
+    assert any("NOT SPECIFIED" in line for line in text)
+
+
+# --- v1.8.1: D3 builder and checker agree on layouts ------------------------
+
+
+def test_layout_less_report_declares_no_layouts_and_is_judged_on_that():
+    """D3: the builder passed an empty set (vacuous pass) while check.py demanded A3/A1/A0."""
+    report = {"paper_layouts": {"sheets": []}, "outputs": {"sheet_mm": 420.0}}
+    assert qa.ExpectedLayoutResolver.from_report(report) == frozenset()
+
+
+def test_report_declaring_a_single_sheet_is_judged_against_it_only():
+    report = {"paper_layouts": {"sheets": ["A3 1:250"]}, "outputs": {"sheet_mm": 420.0}}
+    assert qa.ExpectedLayoutResolver.from_report(report) == frozenset({"A3-1_250"})
+
+
+def test_absent_report_keeps_the_conservative_legacy_expectation():
+    assert qa.ExpectedLayoutResolver.from_report(None) == qa.ALL_LAYOUTS
+
+
+def test_builder_forwards_an_empty_declaration_instead_of_disabling_the_check(tmp_path):
+    """An empty expectation must reach the DXF check, not be replaced by `or ()`."""
+    captured = {}
+
+    def fake_qa_directory(path, *, include_report, expected_layouts, expected_png_px):
+        captured["expected_layouts"] = expected_layouts
+        return {"ok": True, "findings": [], "dxf": {}}
+
+    original = build.qa_output_directory
+    build.qa_output_directory = fake_qa_directory
+    try:
+        build.qa_outputs(tmp_path, 0, 0, 32630, 4961, expected_layouts=[])
+    finally:
+        build.qa_output_directory = original
+    assert captured["expected_layouts"] == frozenset()
+
+
+def test_dxf_without_layouts_passes_when_none_are_expected(tmp_path):
+    import ezdxf
+
+    doc = ezdxf.new("R2018", setup=True)
+    doc.header["$INSUNITS"] = 6
+    doc.header["$USERI1"] = 32630
+    path = tmp_path / "no-layout.dxf"
+    doc.saveas(path)
+    findings = qa.qa_dxf_file(path, frozenset())["findings"]
+    assert not any("paper layouts" in finding for finding in findings)
+
+
+# --- v1.8.1: D4 no provenance claim without a supplied aerial ---------------
+
+
+def test_warnings_do_not_claim_a_reference_aerial_that_was_not_supplied():
+    warnings = build.build_warnings(None, 0.12, _Provider(), "osm-api-map-bbox", [])
+    joined = " ".join(warnings)
+    assert "No reference aerial supplied" in joined
+    assert "Reference JPEG has no EXIF" not in joined
+
+
+def test_warnings_do_mention_the_aerial_when_one_was_supplied(tmp_path):
+    warnings = build.build_warnings(tmp_path / "aerial.jpg", 0.12, _Provider(), "overpass", [])
+    joined = " ".join(warnings)
+    assert "Reference JPEG has no EXIF" in joined
+    assert "No reference aerial supplied" not in joined
+
+
+def test_warnings_only_claim_the_overpass_fallback_when_it_happened():
+    fallback = " ".join(build.build_warnings(None, 0.12, _Provider(), "osm-api-map-bbox", []))
+    direct = " ".join(build.build_warnings(None, 0.12, _Provider(), "overpass", []))
+    assert "Overpass endpoints were unavailable" in fallback
+    assert "Overpass endpoints were unavailable" not in direct
+
+
+def test_attribution_omits_a_user_aerial_without_one():
+    """D4: a print deliverable must not credit an aerial that was never supplied.
+
+    Builds the attribution string the same way ``build()`` does, with and without
+    an image, and asserts the suffix tracks the input rather than being constant.
+    """
+    import inspect
+
+    source = inspect.getsource(build.build)
+    assert 'attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}"' in source
+    assert 'attribution += "; reference aerial supplied by user."' in source
+    assert "if image_path:\n        attribution +=" in source
+
+
+class _Provider:
+    name = "microsoft"
+    attribution = "Microsoft Global ML Building Footprints (CDLA-Permissive-2.0)"

@@ -380,3 +380,72 @@ def test_build_summary_embeds_reconciliation_and_audit():
     assert reconciliation["nested_retained"] > 0
     assert reconciliation["audit"]["consistent"] is True
     assert reconciliation["pairs"]
+
+
+# --- v1.8.1: authoritative invariant (D1) -----------------------------------
+
+
+@pytest.mark.parametrize("mode", list(ContainmentPolicy))
+def test_authoritative_records_survive_every_policy(mode):
+    """The Tlemcen defect: ABSORB deleted real OSM buildings and reported a clean audit.
+
+    An ML envelope containing an OSM way used to remove the OSM way in phase B,
+    which runs over the merged set and does not know authority. Authority is an
+    invariant, not a phase.
+    """
+    osm = FootprintRecord(box(0, 0, 55, 16), "osm", "osm:way:1566634621", None, "ODbL-1.0")
+    envelope = _rec(box(0, 0, 58, 47), "ms:11856")
+    log = ReconciliationLog()
+    result = merge_footprint_records(
+        [osm], [envelope], policy=ReconciliationPolicy(containment_policy=mode), reconciliation=log
+    )
+    assert "osm:way:1566634621" in [record.source_id for record in result], mode
+    assert log.authoritative_contained_dropped == 0
+
+
+@pytest.mark.parametrize("mode", list(ContainmentPolicy))
+def test_authoritative_records_are_never_absorbed_and_the_shield_is_reported(mode):
+    osm = FootprintRecord(box(10, 10, 20, 20), "osm", "osm:small", None, "ODbL-1.0")
+    envelope = _rec(box(0, 0, 900, 400), "ms:env")
+    log = ReconciliationLog()
+    merge_footprint_records([osm], [envelope], policy=ReconciliationPolicy(containment_policy=mode), reconciliation=log)
+    if mode is ContainmentPolicy.ABSORB:
+        # The policy wanted to absorb it; authority shielded it and said so.
+        assert log.absorbed == 0
+        assert log.protected_from_absorption == ["osm:small"]
+    summary = log.summary()
+    assert summary["authoritative_protected_from_absorption"] == sorted(log.protected_from_absorption)
+
+
+def test_absorb_still_absorbs_inferred_footprints():
+    """The invariant must not neuter the policy for inferred records."""
+    envelope = _rec(box(0, 0, 900, 400), "ms:env")
+    sheds = [_rec(box(100 + 30 * i, 100, 108 + 30 * i, 108), f"ms:shed{i}") for i in range(5)]
+    policy = ReconciliationPolicy(containment_policy=ContainmentPolicy.ABSORB)
+    nested = merge_footprint_records([], [envelope, *sheds])
+    absorbed = merge_footprint_records([], [envelope, *sheds], policy=policy)
+    assert len(nested) == 6
+    assert len(absorbed) == 1
+
+
+def test_protected_authoritative_pair_says_why_in_the_log():
+    osm = FootprintRecord(box(10, 10, 20, 20), "osm", "osm:small", None, "ODbL-1.0")
+    envelope = _rec(box(0, 0, 900, 400), "ms:env")
+    log = ReconciliationLog()
+    merge_footprint_records(
+        [osm],
+        [envelope],
+        policy=ReconciliationPolicy(containment_policy=ContainmentPolicy.ABSORB),
+        reconciliation=log,
+    )
+    protected = [pair for pair in log.sorted_pairs() if pair["child"]["source_id"] == "osm:small"]
+    assert protected
+    assert all(pair["decision"] == "retained" for pair in protected)
+    assert any("never removes an authoritative footprint" in pair["reason"] for pair in protected)
+
+
+def test_classification_exposes_is_distinct():
+    distinct = classify(box(0, 0, 10, 10), box(500, 500, 510, 510), ReconciliationPolicy())
+    assert distinct.is_distinct is True
+    assert distinct.is_containment is False
+    assert distinct.is_duplicate is False
