@@ -56,6 +56,13 @@ class FootprintProvider(str, Enum):
     GOOGLE_OPEN_BUILDINGS = "google-open-buildings"
 
 
+class SheetOrientation(str, Enum):
+    """ISO 216 page orientation. Landscape is 420x297 for A3; portrait is 297x420."""
+
+    LANDSCAPE = "landscape"
+    PORTRAIT = "portrait"
+
+
 class ContainmentPolicyChoice(str, Enum):
     """What to do when one footprint encloses another."""
 
@@ -96,6 +103,7 @@ class CadGenerationResult(BaseModel):
     resolved_s2_cell_ids: list[str] = Field(default_factory=list)
     qa_contract_version: str
     containment_policy: str = "nested"
+    orientation: str = "landscape"
     nested_pairs_reported: int = 0
     warning: str = "Input imagery/data are not a cadastral survey; inspect provenance and QA report."
 
@@ -172,6 +180,7 @@ def _build_command(
     provider: FootprintProvider,
     sheet_size: str,
     denominator: int,
+    orientation: SheetOrientation,
     google_min_confidence: float,
     target_precision: TargetPrecision | None,
     footprint_file: Path | None,
@@ -193,6 +202,8 @@ def _build_command(
         sheet_size,
         "--layout-scale",
         str(denominator),
+        "--orientation",
+        orientation.value,
         "--footprint-provider",
         provider.value,
         "--report-detail",
@@ -219,7 +230,11 @@ def generate_cad_plan(
     lat: Annotated[float, Field(ge=-90, le=90, description="Latitude in WGS84 degrees")],
     lon: Annotated[float, Field(ge=-180, le=180, description="Longitude in WGS84 degrees")],
     scale: Annotated[str, Field(pattern=r"^1:(250|500|1000)$", description="Printed map scale")],
-    sheet_size: Annotated[str, Field(pattern=r"^(A3|A1|A0)$", description="Landscape ISO sheet size")],
+    sheet_size: Annotated[str, Field(pattern=r"^(A3|A1|A0)$", description="ISO 216 sheet size")],
+    orientation: Annotated[
+        SheetOrientation,
+        Field(description="ISO 216 page orientation: landscape (default) or portrait"),
+    ] = SheetOrientation.LANDSCAPE,
     study_radius_m: Annotated[
         float | None, Field(gt=0, le=5000, description="Study radius in metres; omit for the sheet-fitted default")
     ] = None,
@@ -290,6 +305,7 @@ def generate_cad_plan(
         provider=footprint_provider,
         sheet_size=sheet_size,
         denominator=denominator,
+        orientation=orientation,
         google_min_confidence=google_min_confidence,
         target_precision=google_target_precision,
         footprint_file=resolved_footprint_file,
@@ -330,6 +346,7 @@ def generate_cad_plan(
         resolved_s2_cell_ids=footprints.get("resolved_s2_cell_ids") or [],
         qa_contract_version=_QA.QA_CONTRACT_VERSION,
         containment_policy=str(containment_policy.value),
+        orientation=str(orientation.value),
         nested_pairs_reported=int(((footprints.get("reconciliation") or {}).get("nested_retained")) or 0),
     )
 

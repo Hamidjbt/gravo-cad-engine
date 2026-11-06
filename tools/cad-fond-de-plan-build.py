@@ -34,7 +34,14 @@ from footprint_providers import (
     merge_footprint_records,
     threshold_provenance_report,
 )
-from layout_engine import add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set
+from layout_engine import (
+    add_paperspace_viewport,
+    coverage_bounds,
+    metadata_from_utm,
+    resolve_layout,
+    resolve_placement,
+    resolve_sheet_set,
+)
 from PIL import Image
 from pyproj import Transformer
 from reconciliation import ContainmentPolicy, ReconciliationLog, ReconciliationPolicy
@@ -48,7 +55,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.8.1"
+ENGINE_VERSION = "1.9.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -668,26 +675,42 @@ def line_hatches(poly: Polygon, spacing_m: float) -> list[LineString]:
     return lines
 
 
-def mm_point(x: float, y: float, center: tuple[float, float], scale_mm_m: float) -> tuple[float, float]:
-    cx, cy = center
-    return (x - cx + 300.0) * scale_mm_m, (300.0 - (y - cy)) * scale_mm_m
+def mm_point(
+    x: float,
+    y: float,
+    placement,
+    scale_mm_m: float | None = None,
+) -> tuple[float, float]:
+    """Model metres to millimetres on the declared page.
+
+    The origin comes from the placement, so the mapping follows the page instead of an
+    assumed 600 m square. ``scale_mm_m`` is accepted for callers that still pass the old
+    scalar; when given it must agree with the placement, because two different scales in
+    one drawing is exactly the silent-corruption case this release removes.
+    """
+    if scale_mm_m is not None and abs(scale_mm_m - placement.mm_per_m) > 1e-9:
+        raise ValueError(
+            f"scale {scale_mm_m:.9g} mm/m disagrees with declared 1:{placement.scale} ({placement.mm_per_m:.9g} mm/m)"
+        )
+    ox, oy = placement.origin_mm
+    return ox + x * placement.mm_per_m, oy - y * placement.mm_per_m
 
 
-def svg_path_line(geom, center, scale) -> str:
+def svg_path_line(geom, placement) -> str:
     parts = flatten_lines(geom)
     commands = []
     for line in parts:
-        pts = [mm_point(x, y, center, scale) for x, y in line.coords]
+        pts = [mm_point(x, y, placement) for x, y in line.coords]
         if not pts:
             continue
         commands.append(f"M {pts[0][0]:.4f},{pts[0][1]:.4f} " + " ".join(f"L {x:.4f},{y:.4f}" for x, y in pts[1:]))
     return " ".join(commands)
 
 
-def svg_path_polygon(poly: Polygon, center, scale) -> str:
+def svg_path_polygon(poly: Polygon, placement) -> str:
     commands = []
     for ring in [poly.exterior, *poly.interiors]:
-        pts = [mm_point(x, y, center, scale) for x, y in ring.coords]
+        pts = [mm_point(x, y, placement) for x, y in ring.coords]
         commands.append(
             f"M {pts[0][0]:.4f},{pts[0][1]:.4f} " + " ".join(f"L {x:.4f},{y:.4f}" for x, y in pts[1:]) + " Z"
         )
@@ -701,30 +724,47 @@ def write_svg(
     parcels: list[LineString],
     site: Polygon,
     hatch_geoms: list[LineString],
-    center: tuple[float, float],
-    sheet_mm: float,
-    scale_mm_m: float,
+    placement,
     hatched: bool,
 ):
+    """Write one true-to-scale sheet.
+
+    The page is the declared ISO 216 size in millimetres and the ``viewBox`` is the same
+    millimetre rectangle, so 1 unit == 1 mm and a plotter reproduces the declared scale
+    exactly. Geometry is clipped to the usable area rather than rescaled into it.
+    """
+    page_w, page_h = placement.page_w_mm, placement.page_h_mm
     dwg = svgwrite.Drawing(
-        str(path), size=(f"{sheet_mm}mm", f"{sheet_mm}mm"), viewBox=f"0 0 {sheet_mm} {sheet_mm}", profile="full"
+        str(path), size=(f"{page_w}mm", f"{page_h}mm"), viewBox=f"0 0 {page_w} {page_h}", profile="full"
     )
-    dwg.add(dwg.rect(insert=(0, 0), size=(sheet_mm, sheet_mm), fill="#FFFFFF"))
+    dwg.add(dwg.rect(insert=(0, 0), size=(page_w, page_h), fill="#FFFFFF"))
+    # Clip the map to the usable area: content beyond the margins must be cut, never
+    # squeezed, or the plot would silently print at the wrong scale.
+    ux, uy, uw, uh = placement.usable_rect_mm
+    # svgwrite returns the added element, but defs.add() does not nest for us: the rect
+    # must be a child of the clipPath or the url(#USABLE_AREA) reference resolves to
+    # nothing and the sheet is silently unclipped.
+    clip = dwg.clipPath(id="USABLE_AREA")
+    clip.add(dwg.rect(insert=(ux, uy), size=(uw, uh)))
+    dwg.defs.add(clip)
+    map_group = dwg.g()
+    map_group.attribs["clip-path"] = "url(#USABLE_AREA)"
+    dwg.add(map_group)
     g_roads = dwg.g(
         id="ROADS", fill="none", stroke="#000000", stroke_width="0.35", stroke_linecap="butt", stroke_linejoin="round"
     )
-    p = svg_path_line(road_boundaries, center, scale_mm_m)
+    p = svg_path_line(road_boundaries, placement)
     if p:
         g_roads.add(dwg.path(d=p))
-    dwg.add(g_roads)
+    map_group.add(g_roads)
     g_parcels = dwg.g(
         id="PARCELS", fill="none", stroke="#000000", stroke_width="0.18", stroke_linecap="butt", stroke_linejoin="miter"
     )
     for line in parcels:
-        d = svg_path_line(line, center, scale_mm_m)
+        d = svg_path_line(line, placement)
         if d:
             g_parcels.add(dwg.path(d=d))
-    dwg.add(g_parcels)
+    map_group.add(g_parcels)
     g_build = dwg.g(
         id="BUILDINGS",
         fill="#FFFFFF",
@@ -734,22 +774,22 @@ def write_svg(
         stroke_linejoin="miter",
     )
     for poly in buildings:
-        g_build.add(dwg.path(d=svg_path_polygon(poly, center, scale_mm_m)))
-    dwg.add(g_build)
+        g_build.add(dwg.path(d=svg_path_polygon(poly, placement)))
+    map_group.add(g_build)
     if hatched:
         g_hatch = dwg.g(id="HATCH", fill="none", stroke="#000000", stroke_width="0.13", stroke_linecap="butt")
         for line in hatch_geoms:
-            d = svg_path_line(line, center, scale_mm_m)
+            d = svg_path_line(line, placement)
             if d:
                 g_hatch.add(dwg.path(d=d))
-        dwg.add(g_hatch)
+        map_group.add(g_hatch)
         # Redraw walls over the clipped hatch to preserve a crisp architectural perimeter.
         g_outer = dwg.g(
             id="BUILDING_WALLS_OVER_HATCH", fill="none", stroke="#000000", stroke_width="0.50", stroke_linejoin="miter"
         )
         for poly in buildings:
-            g_outer.add(dwg.path(d=svg_path_polygon(poly, center, scale_mm_m)))
-        dwg.add(g_outer)
+            g_outer.add(dwg.path(d=svg_path_polygon(poly, placement)))
+        map_group.add(g_outer)
     if not site.is_empty:
         g_site = dwg.g(
             id="SITE_BOUNDARY",
@@ -760,8 +800,8 @@ def write_svg(
             stroke_linecap="butt",
             stroke_linejoin="round",
         )
-        g_site.add(dwg.path(d=svg_path_polygon(site, center, scale_mm_m)))
-        dwg.add(g_site)
+        g_site.add(dwg.path(d=svg_path_polygon(site, placement)))
+        map_group.add(g_site)
     dwg.save(pretty=True)
 
 
@@ -787,6 +827,7 @@ def write_dxf(
     shared_walls=None,
     layout_bounds_m=None,
     layout_spec: tuple[str, int] | None = None,
+    orientation: str = "landscape",
 ):
     """Write a metric R2018 model plus optional exact-scale multi-sheet paper layouts."""
     doc = ezdxf.new("R2018", setup=True)
@@ -854,9 +895,9 @@ def write_dxf(
 
     if layout_bounds_m is not None:
         layouts = (
-            [resolve_layout(tuple(layout_bounds_m), layout_spec[0], layout_spec[1])]
+            [resolve_layout(tuple(layout_bounds_m), layout_spec[0], layout_spec[1], orientation=orientation)]
             if layout_spec
-            else resolve_sheet_set(tuple(layout_bounds_m))
+            else resolve_sheet_set(tuple(layout_bounds_m), orientation=orientation)
         )
         area = float(site.area) if site is not None and not site.is_empty else None
         focus_e = (float(layout_bounds_m[0]) + float(layout_bounds_m[2])) / 2.0
@@ -868,16 +909,104 @@ def write_dxf(
     doc.saveas(path)
 
 
-def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Path, sheet_mm: float):
+def resolve_sheet_placement(args, radius: float, center_utm: tuple[float, float]):
+    """Resolve the printed page for this run.
+
+    A requested ``--layout-sheet``/``--layout-scale`` pair is the only statement of a real
+    plot scale, so it drives the sheet. Without one, ``--sheet-mm`` names a custom square
+    page and the scale is whatever fits the radius — reported honestly as ``custom``
+    rather than mislabelled "A3".
+    """
+    layout_sheet = getattr(args, "layout_sheet", None)
+    if layout_sheet:
+        default_scales = {"A3": 250, "A1": 500, "A0": 1000}
+        scale = int(args.layout_scale or default_scales[layout_sheet])
+        placement = resolve_placement(
+            coverage_bounds(
+                center_utm, _nominal_page(layout_sheet, getattr(args, "orientation", "landscape")), pad_m=radius
+            ),
+            sheet=layout_sheet,
+            scale=scale,
+            orientation=getattr(args, "orientation", "landscape"),
+        )
+        ground_w, ground_h = placement.ground_extent_m
+        if 2 * radius > ground_w + 1e-6 or 2 * radius > ground_h + 1e-6:
+            raise ValueError(
+                f"Geometry {2 * radius:.3f}x{2 * radius:.3f}m does not fit {layout_sheet} at 1:{scale}; "
+                "choose a smaller denominator or larger sheet"
+            )
+        return placement
+
+    side_mm = float(args.sheet_mm)
+    scale = max(1, round(2 * radius * 1000.0 / side_mm))
+    return resolve_placement(
+        (-radius, -radius, radius, radius),
+        sheet="custom",
+        scale=scale,
+        orientation="landscape",
+        page_mm_override=(side_mm, side_mm),
+        margin_mm=0.0,
+    )
+
+
+def _nominal_page(sheet: str, orientation: str):
+    """A placement used only to read the page's ground extent before placing content."""
+    return resolve_placement((-1.0, -1.0, 1.0, 1.0), sheet=sheet, scale=1000, orientation=orientation)
+
+
+def expected_png_px(placement) -> tuple[int, int]:
+    """Raster size of the sheet at 300 dpi, per axis.
+
+    Derived from the page itself, so a 420 x 297 mm sheet cannot silently become a
+    4961-pixel square.
+    """
+    return (
+        round(placement.page_w_mm / 25.4 * 300),
+        round(placement.page_h_mm / 25.4 * 300),
+    )
+
+
+def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Path, placement):
+    """Rasterise the declared page at 300 dpi, per axis.
+
+    Both output dimensions come from the page, so a rectangular sheet produces a
+    rectangular raster and the pixel:millimetre ratio stays uniform on both axes.
+    """
     import cairosvg
 
-    width_px = round(sheet_mm / 25.4 * 300)
+    width_px, height_px = expected_png_px(placement)
     cairosvg.svg2png(
-        url=str(hatched_svg), write_to=str(out_png), output_width=width_px, output_height=width_px, dpi=300
+        url=str(hatched_svg), write_to=str(out_png), output_width=width_px, output_height=height_px, dpi=300
     )
     with Image.open(out_png) as im:
         im.save(out_png, dpi=(300, 300), optimize=True)
     cairosvg.svg2pdf(url=str(hatched_svg), write_to=str(out_pdf), dpi=96)
+
+
+def _page_aspect_findings(out_dir: Path, page_mm: tuple[float, float]) -> list[str]:
+    """Assert the raster and vector sheets carry the declared page's aspect ratio.
+
+    Both axes are checked because a square sheet reported as A3 is the specific defect
+    this release fixes: it silently rescales one axis and prints at a scale the drawing
+    does not claim.
+    """
+    findings: list[str] = []
+    expected_ratio = page_mm[0] / page_mm[1]
+    png = out_dir / "fond-de-plan-sheet-300dpi.png"
+    try:
+        from PIL import Image
+
+        with Image.open(png) as image:
+            width, height = image.size
+        ratio = width / height
+        if abs(ratio - expected_ratio) > 1e-3:
+            findings.append(
+                f"{png.name}: aspect ratio {ratio:.4f} does not match the declared page "
+                f"{page_mm[0]:g}x{page_mm[1]:g}mm ({expected_ratio:.4f})"
+            )
+    except Exception as exc:  # noqa: BLE001 - absent/corrupt rasters are reported elsewhere
+        findings.append(f"{png.name}: aspect ratio check failed: {type(exc).__name__}: {exc}")
+    return findings
 
 
 def qa_outputs(
@@ -885,9 +1014,10 @@ def qa_outputs(
     building_count: int,
     hatch_count: int,
     epsg: int,
-    expected_px: int,
+    expected_px: tuple[int, int] | int,
     *,
     expected_layouts: list[str] | None = None,
+    declared_page_mm: tuple[float, float] | None = None,
 ) -> dict:
     """Run the shared QA contract over the just-written deliverables.
 
@@ -903,8 +1033,14 @@ def qa_outputs(
         # request to fall back to the legacy A3/A1/A0 set (D3).
         expected_layouts=frozenset(expected_layouts or []),
         expected_png_px=expected_px,
+        declared_page_mm=declared_page_mm,
     )
+    if declared_page_mm is not None:
+        findings_pre = _page_aspect_findings(out_dir, declared_page_mm)
+    else:
+        findings_pre = []
     findings = [finding for finding in result["findings"] if not finding.startswith("missing deliverable:")]
+    findings.extend(findings_pre)
     for name in DRAWING_DELIVERABLES:
         candidate = out_dir / name
         if not candidate.exists() or candidate.stat().st_size < 100:
@@ -1141,8 +1277,11 @@ def build(args) -> dict:
     parcels = extract_parcels(osm, to_utm, study_circle, manual_parcels, cx, cy)
     parcels, frontage_snaps = reconcile_parcel_frontages(parcels, road_casement, tolerance_m=0.35)
 
-    sheet_mm = float(args.sheet_mm)
-    scale_mm_m = sheet_mm / (2 * radius)
+    # D5: the printed sheet is resolved through the ISO 216 layout engine, never a
+    # square derived from --sheet-mm. A declared --layout-sheet/--layout-scale wins,
+    # because that is the only pair that states a real plot scale.
+    sheet_placement = resolve_sheet_placement(args, radius, (cx, cy))
+    scale_mm_m = sheet_placement.mm_per_m
     # Requested 3.5 px hatch pitch at 96 DPI, converted to world metres at declared plot scale.
     hatch_pitch_mm = 3.5 / (96.0 / 25.4)
     hatch_spacing_m = hatch_pitch_mm / scale_mm_m
@@ -1151,8 +1290,8 @@ def build(args) -> dict:
         hatch_geoms.extend(line_hatches(poly, hatch_spacing_m))
     hollow = out_dir / "fond-de-plan-hollow.svg"
     hatched = out_dir / "fond-de-plan-hatched.svg"
-    write_svg(hollow, buildings, road_boundaries, parcels, site, [], (cx, cy), sheet_mm, scale_mm_m, False)
-    write_svg(hatched, buildings, road_boundaries, parcels, site, hatch_geoms, (cx, cy), sheet_mm, scale_mm_m, True)
+    write_svg(hollow, buildings, road_boundaries, parcels, site, [], sheet_placement, False)
+    write_svg(hatched, buildings, road_boundaries, parcels, site, hatch_geoms, sheet_placement, True)
     layout_bounds_m = (
         tuple(site.bounds)
         if not site.is_empty
@@ -1178,10 +1317,11 @@ def build(args) -> dict:
         shared_walls=block_topology.shared_walls,
         layout_bounds_m=layout_bounds_m,
         layout_spec=layout_spec,
+        orientation=sheet_placement.orientation,
     )
     png_path, pdf_path = out_dir / "fond-de-plan-sheet-300dpi.png", out_dir / "fond-de-plan-sheet-300dpi.pdf"
-    render_sheet(hollow, hatched, png_path, pdf_path, sheet_mm)
-    expected_px = round(sheet_mm / 25.4 * 300)
+    render_sheet(hollow, hatched, png_path, pdf_path, sheet_placement)
+    expected_px = expected_png_px(sheet_placement)
     layout_sheets = (
         [f"{layout_spec[0]} 1:{layout_spec[1]}"]
         if layout_spec
@@ -1200,6 +1340,7 @@ def build(args) -> dict:
         epsg,
         expected_px,
         expected_layouts=expected_layout_names,
+        declared_page_mm=(sheet_placement.page_w_mm, sheet_placement.page_h_mm),
     )
     footprint_summary = build_footprint_summary(
         provider,
@@ -1240,7 +1381,7 @@ def build(args) -> dict:
         "center": {"lat": lat, "lon": lon, "utm_x_m": cx, "utm_y_m": cy, "epsg": epsg, "zone": (epsg % 100)},
         "google_maps_resolved_url": resolved_url,
         "radius_m": radius,
-        "scale": f"1:{(2 * radius * 1000 / sheet_mm):.1f}",
+        "scale": f"1:{sheet_placement.scale}",
         "photo_georeference": {
             "path": str(image_path) if image_path else None,
             "anchor_pixel": list(anchor),
@@ -1293,6 +1434,19 @@ def build(args) -> dict:
             "layout_bounds_m": list(layout_bounds_m) if layout_bounds_m else None,
             "cartouche_mm": [180, 50],
             "grid_spacing_m": "50 (A3/A1), 100 (A0)",
+            "sheet": sheet_placement.to_dict(),
+            # Does the printed page actually cover the requested radius? A 1:500 page
+            # only shows 200 x 138 m of ground; claiming "1:500" for a 600 m site would
+            # be a true denominator attached to a false statement about what is on it.
+            "sheet_coverage_m": [
+                round(sheet_placement.ground_extent_m[0], 3),
+                round(sheet_placement.ground_extent_m[1], 3),
+            ],
+            "requested_extent_m": round(2 * radius, 3),
+            "scale_consistent": bool(
+                sheet_placement.ground_extent_m[0] + 1e-6 >= 2 * radius
+                and sheet_placement.ground_extent_m[1] + 1e-6 >= 2 * radius
+            ),
         },
         "site_boundary": {
             # D4: a run without --image has no supplied aerial and no manual trace;
@@ -1315,7 +1469,12 @@ def build(args) -> dict:
                 "fond-de-plan-report.json",
             ]
         }
-        | {"sheet_mm": sheet_mm, "expected_png_px": expected_px},
+        | {
+            "sheet_mm": sheet_placement.page_w_mm,
+            "sheet_mm_secondary": sheet_placement.page_h_mm,
+            "expected_png_px": list(expected_px),
+            "sheet": sheet_placement.to_dict(),
+        },
         "provenance": provenance_block(
             engine_version=ENGINE_VERSION,
             generated_at=generated_at_utc,
@@ -1329,7 +1488,10 @@ def build(args) -> dict:
                 "google_min_confidence": min_confidence,
                 "google_target_precision": target_precision,
                 "radius_m": radius,
-                "sheet_mm": sheet_mm,
+                "sheet_mm": sheet_placement.page_w_mm,
+                "sheet_mm_secondary": sheet_placement.page_h_mm,
+                "sheet_name": sheet_placement.sheet,
+                "orientation": sheet_placement.orientation,
                 "layout_sheets": layout_sheets,
                 "epsg": epsg,
             },
@@ -1432,6 +1594,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default=str(Path.home() / "site-plan"))
     p.add_argument("--sheet-mm", type=float, default=420.0)
     p.add_argument("--layout-sheet", choices=("A3", "A1", "A0"), help="add one exact-scale paper-space layout")
+    p.add_argument(
+        "--orientation",
+        choices=("landscape", "portrait"),
+        default="landscape",
+        help="ISO 216 page orientation for the printed sheet (default: landscape)",
+    )
     p.add_argument(
         "--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet"
     )

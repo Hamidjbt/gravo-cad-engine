@@ -52,7 +52,10 @@ REQUIRED_LAYERS: dict[str, dict[str, Any]] = {
 REQUIRED_LAYER_NAMES = frozenset(REQUIRED_LAYERS)
 ANNOTATION_BLOCKS = ("GRID_CROSS", "NORTH_ARROW")
 ALL_LAYOUTS = frozenset({"A3-1_250", "A1-1_500", "A0-1_1000"})
-DEFAULT_PNG_PX = 4961  # 420 mm square at 300 dpi
+# Legacy square sheet at 300 dpi. Kept only for reports that predate v1.9.0 and
+# declare no page geometry; every current report states its own page.
+DEFAULT_PNG_PX = 4961
+ISO_216_MM = {"A3": (420.0, 297.0), "A1": (841.0, 594.0), "A0": (1189.0, 841.0)}
 MIN_DELIVERABLE_BYTES = 100
 
 
@@ -91,26 +94,77 @@ class ExpectedLayoutResolver:
         return frozenset(cls.sheet_label_to_layout(str(label)) for label in declared)
 
     @classmethod
-    def expected_png_px(cls, report: dict[str, Any] | None) -> int:
+    def declared_page_mm(cls, report: dict[str, Any] | None) -> tuple[float, float] | None:
+        """The page the report says it printed, as (width_mm, height_mm).
+
+        Current reports declare ``outputs.sheet``; older ones declared a single square
+        ``outputs.sheet_mm``. Returning None means "unknown", which callers must treat as
+        the legacy square rather than as a pass.
+        """
         if not report:
-            return DEFAULT_PNG_PX
-        sheet_mm = (report.get("outputs") or {}).get("sheet_mm")
+            return None
+        outputs = report.get("outputs") or {}
+        sheet = outputs.get("sheet") or {}
+        page = sheet.get("page_mm") or {}
+        width, height = page.get("width"), page.get("height")
         try:
-            return round(float(sheet_mm) / 25.4 * 300)
+            if width is not None and height is not None:
+                return (float(width), float(height))
         except (TypeError, ValueError):
-            return DEFAULT_PNG_PX
+            return None
+        legacy = outputs.get("sheet_mm")
+        try:
+            if legacy is not None:
+                return (float(legacy), float(legacy))
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    @classmethod
+    def expected_png_px(cls, report: dict[str, Any] | None) -> tuple[int, int]:
+        """Raster size at 300 dpi, per axis. Never a single square number."""
+        page = cls.declared_page_mm(report)
+        if page is None:
+            return (DEFAULT_PNG_PX, DEFAULT_PNG_PX)
+        return (round(page[0] / 25.4 * 300), round(page[1] / 25.4 * 300))
 
 
-def _svg_findings(path: Path, sheet_mm: float | None) -> list[str]:
+def _mm_tokens(value: float) -> set[str]:
+    """Accept the several spellings a producer may use for one millimetre value."""
+    return {f"{value:g}mm", f"{value:.1f}mm", f"{float(value):g}mm"}
+
+
+def _svg_findings(path: Path, page_mm: tuple[float, float] | float | None) -> list[str]:
+    """Validate SVG page geometry against the declared page, per axis.
+
+    A rectangular sheet reported as square is a plotting error, not a cosmetic one: it
+    rescales one axis and prints at a scale the drawing does not claim.
+    """
     findings: list[str] = []
-    expected = {f"{sheet_mm:g}mm", f"{sheet_mm:.1f}mm", f"{float(sheet_mm):g}mm"} if sheet_mm else {"420mm", "420.0mm"}
+    if page_mm is None:
+        page_w = page_h = 420.0
+    elif isinstance(page_mm, (int, float)):
+        page_w = page_h = float(page_mm)
+    else:
+        page_w, page_h = (float(page_mm[0]), float(page_mm[1]))
     try:
         root = ET.parse(path).getroot()
     except Exception as exc:  # noqa: BLE001 - report any parse failure as a finding
         return [f"{path.name}: SVG parse failed: {type(exc).__name__}: {exc}"]
     width, height = root.attrib.get("width"), root.attrib.get("height")
-    if width not in expected or height not in expected:
-        findings.append(f"{path.name}: page must be {sheet_mm or 420:g}mm square, found {width}x{height}")
+    expected_w, expected_h = _mm_tokens(page_w), _mm_tokens(page_h)
+    if width not in expected_w or height not in expected_h:
+        findings.append(f"{path.name}: page must be {page_w:g}x{page_h:g}mm, found {width}x{height}")
+    viewbox = root.attrib.get("viewBox")
+    if viewbox:
+        parts = viewbox.replace(",", " ").split()
+        if len(parts) == 4:
+            try:
+                vb_w, vb_h = float(parts[2]), float(parts[3])
+            except ValueError:
+                vb_w = vb_h = -1.0
+            if abs(vb_w - page_w) > 0.5 or abs(vb_h - page_h) > 0.5:
+                findings.append(f"{path.name}: viewBox {vb_w:g}x{vb_h:g} does not match page {page_w:g}x{page_h:g}mm")
     for element in root.iter():
         tag = element.tag.rsplit("}", 1)[-1]
         if tag in {"text", "image", "use"}:
@@ -231,14 +285,16 @@ def qa_dxf_file(path: Path, expected_layouts: frozenset[str] | None = None) -> d
     }
 
 
-def _png_findings(path: Path, expected_px: int) -> list[str]:
+def _png_findings(path: Path, expected_px: tuple[int, int] | int) -> list[str]:
     findings: list[str] = []
+    if isinstance(expected_px, int):
+        expected_px = (expected_px, expected_px)
     try:
         from PIL import Image
 
         with Image.open(path) as image:
-            if image.size != (expected_px, expected_px):
-                findings.append(f"{path.name}: dimensions {image.size}, expected {expected_px}x{expected_px}")
+            if image.size != tuple(expected_px):
+                findings.append(f"{path.name}: dimensions {image.size}, expected {expected_px[0]}x{expected_px[1]}")
             if round(image.info.get("dpi", (0, 0))[0]) != 300:
                 findings.append(f"{path.name}: DPI {image.info.get('dpi')}, expected 300")
             if image.mode not in {"RGB", "RGBA"}:
@@ -285,7 +341,8 @@ def qa_output_directory(
     *,
     include_report: bool = True,
     expected_layouts: frozenset[str] | list[str] | None = None,
-    expected_png_px: int | None = None,
+    expected_png_px: tuple[int, int] | int | None = None,
+    declared_page_mm: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Validate a deliverable directory with one consistent verdict.
 
@@ -328,10 +385,18 @@ def qa_output_directory(
         frozenset(expected_layouts) if expected_layouts is not None else ExpectedLayoutResolver.from_report(report)
     )
     resolved_px = expected_png_px if expected_png_px is not None else ExpectedLayoutResolver.expected_png_px(report)
-    sheet_mm = (report.get("outputs") or {}).get("sheet_mm") if report else None
+    # The builder runs QA before writing the report, so it supplies the page it just
+    # printed; a standalone check reads it back from the report.
+    declared_page = (
+        declared_page_mm
+        if declared_page_mm is not None
+        else ExpectedLayoutResolver.declared_page_mm(report)
+        if report
+        else None
+    )
 
     for name in (HOLLOW_SVG, HATCHED_SVG):
-        findings.extend(_svg_findings(path / name, sheet_mm))
+        findings.extend(_svg_findings(path / name, declared_page))
     dxf_result = qa_dxf_file(path / DXF, resolved_layouts)
     findings.extend(dxf_result["findings"])
     findings.extend(_png_findings(path / PNG, resolved_px))
@@ -345,7 +410,8 @@ def qa_output_directory(
         "findings": findings,
         "qa_contract_version": QA_CONTRACT_VERSION,
         "expected_layouts": sorted(resolved_layouts),
-        "expected_png_px": resolved_px,
+        "expected_png_px": list(resolved_px) if not isinstance(resolved_px, int) else resolved_px,
+        "declared_page_mm": list(declared_page) if declared_page else None,
         "dxf": {
             "version": dxf_result["dxf_version"],
             "epsg": dxf_result["epsg"],

@@ -1,6 +1,6 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.8.1  
+**Current release:** 1.9.0  
 **Last updated:** 2026-11-06  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
@@ -192,6 +192,32 @@ disposable / retained), with `make clean`, `make hygiene-report` and `make hygie
 space moves to `/var/tmp`. The governing rule is that the only things ever deleted are those that
 can be regenerated.
 
+### Phase 11 — True print architecture (1.9.0)
+
+Every release through 1.8.1 printed a square sheet. The raster artists and the PDF were produced by
+`sheet_mm / (2 * radius)` scaling on a 420 mm square page, while the DXF carried a correct ISO paper
+space nobody else consulted. Two artifacts in one deliverable described different pages.
+
+`layout_engine` now owns the geometry:
+
+- **`page_size(sheet, orientation)`** returns exact ISO 216 edges; the table stores long/short edges so
+  "A3" can never silently mean "420 square".
+- **`SheetPlacement`** is the metre-to-millimetre map for one printed page. It reserves the cartouche
+  band exactly as `resolve_layout` does, so the raster and the DXF paper space agree on ground extent
+  for every sheet/orientation pair.
+- **`resolve_placement`** centres content at a declared denominator and never rescales.
+- **`coverage_bounds`** distinguishes "the radius bounds the page" from "the page bounds the radius",
+  which is what `scale_consistent` reports.
+
+The raster pipeline now derives its pixel dimensions per axis from the page, clips the map to the usable
+area (a `clipPath` whose absence would silently unclip the sheet), and refuses to emit a square raster for
+a rectangular page. MCP gained an `orientation` parameter, and the DXF writer received the orientation the
+report declares — without it a portrait run produced a portrait report next to a landscape layout tab.
+
+Validated on the live Tlemcen case: A0 1:1000 in both orientations, and a documented refusal for A3 1:500
+and A1 1:1000, which cannot hold a 600 m site. Measured output: 14043 × 9933 px at 300 dpi = 1189 × 841 mm
+exactly, at a uniform 11.811 px/mm.
+
 ---
 
 ## 3. System architecture and modules
@@ -341,7 +367,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.8.1**.
+- Skill/manifest version: **1.9.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.

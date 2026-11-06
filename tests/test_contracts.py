@@ -46,9 +46,20 @@ def test_report_without_layout_declaration_keeps_conservative_expectation():
 
 
 def test_png_pixel_expectation_derives_from_report_sheet_size():
-    assert qa.ExpectedLayoutResolver.expected_png_px({"outputs": {"sheet_mm": 420}}) == 4961
-    assert qa.ExpectedLayoutResolver.expected_png_px(None) == qa.DEFAULT_PNG_PX
-    assert qa.ExpectedLayoutResolver.expected_png_px({"outputs": {"sheet_mm": "bad"}}) == qa.DEFAULT_PNG_PX
+    """Legacy square reports still resolve to a square, but never to a scalar."""
+    assert qa.ExpectedLayoutResolver.expected_png_px({"outputs": {"sheet_mm": 420}}) == (4961, 4961)
+    assert qa.ExpectedLayoutResolver.expected_png_px(None) == (qa.DEFAULT_PNG_PX, qa.DEFAULT_PNG_PX)
+    assert qa.ExpectedLayoutResolver.expected_png_px({"outputs": {"sheet_mm": "bad"}}) == (
+        qa.DEFAULT_PNG_PX,
+        qa.DEFAULT_PNG_PX,
+    )
+
+
+def test_png_pixel_expectation_is_per_axis_for_a_declared_iso_page():
+    """v1.9.0: A3 is 420x297, so the raster is 4961x3508, not a 4961 square."""
+    report = {"outputs": {"sheet": {"page_mm": {"width": 420.0, "height": 297.0}}}}
+    assert qa.ExpectedLayoutResolver.expected_png_px(report) == (4961, 3508)
+    assert qa.ExpectedLayoutResolver.declared_page_mm(report) == (420.0, 297.0)
 
 
 def test_missing_directory_reports_every_absent_deliverable(tmp_path):
@@ -249,6 +260,7 @@ def test_mcp_command_forwards_provider_flags(tmp_path):
         provider=mcp_server.FootprintProvider.GOOGLE_OPEN_BUILDINGS,
         sheet_size="A3",
         denominator=250,
+        orientation=mcp_server.SheetOrientation.LANDSCAPE,
         google_min_confidence=0.65,
         target_precision=mcp_server.TargetPrecision.P90,
         footprint_file=source,
@@ -274,6 +286,7 @@ def test_mcp_command_uses_microsoft_flag_for_default_provider(tmp_path):
         provider=mcp_server.FootprintProvider.MICROSOFT,
         sheet_size="A3",
         denominator=250,
+        orientation=mcp_server.SheetOrientation.LANDSCAPE,
         google_min_confidence=0.65,
         target_precision=None,
         footprint_file=source,
@@ -387,7 +400,7 @@ def test_builder_forwards_an_empty_declaration_instead_of_disabling_the_check(tm
     """An empty expectation must reach the DXF check, not be replaced by `or ()`."""
     captured = {}
 
-    def fake_qa_directory(path, *, include_report, expected_layouts, expected_png_px):
+    def fake_qa_directory(path, *, include_report, expected_layouts, expected_png_px, declared_page_mm=None):
         captured["expected_layouts"] = expected_layouts
         return {"ok": True, "findings": [], "dxf": {}}
 
@@ -453,3 +466,34 @@ def test_attribution_omits_a_user_aerial_without_one():
 class _Provider:
     name = "microsoft"
     attribution = "Microsoft Global ML Building Footprints (CDLA-Permissive-2.0)"
+
+
+# --- v1.9.0: orientation parity across the MCP surface ----------------------
+
+
+def test_mcp_exposes_a_landscape_default_orientation():
+    default = mcp_server.SheetOrientation.LANDSCAPE
+    assert default.value == "landscape"
+    assert mcp_server.SheetOrientation.PORTRAIT.value == "portrait"
+
+
+def test_mcp_command_forwards_portrait_orientation(tmp_path):
+    source = tmp_path / "tile.csv.gz"
+    source.write_bytes(b"{}")
+    command = mcp_server._build_command(
+        lat=34.884528,
+        lon=-1.30125,
+        radius=300.0,
+        output_dir=tmp_path / "out",
+        provider=mcp_server.FootprintProvider.MICROSOFT,
+        sheet_size="A0",
+        denominator=1000,
+        orientation=mcp_server.SheetOrientation.PORTRAIT,
+        google_min_confidence=0.65,
+        target_precision=None,
+        footprint_file=source,
+        osm_file=None,
+        thresholds_file=None,
+    )
+    joined = " ".join(command)
+    assert "--orientation portrait" in joined

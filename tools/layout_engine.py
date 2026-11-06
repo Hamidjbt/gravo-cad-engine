@@ -13,9 +13,28 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
-SHEETS = {"A3": (420.0, 297.0), "A1": (841.0, 594.0), "A0": (1189.0, 841.0)}
+# ISO 216 long/short edges in millimetres. Orientation is applied by page_size()
+# rather than baked into the table, so a sheet name never implies an orientation.
+ISO_216_MM = {"A3": (420.0, 297.0), "A1": (841.0, 594.0), "A0": (1189.0, 841.0)}
+SHEETS = ISO_216_MM  # backwards-compatible alias: landscape edges (long, short)
+ORIENTATIONS = ("landscape", "portrait")
 STANDARD_SCALES = (250, 500, 1000)
 TITLEBLOCK_MM = (180.0, 50.0)
+
+
+def page_size(sheet: str, orientation: str = "landscape") -> tuple[float, float]:
+    """Return the true ISO 216 page for ``sheet`` in ``orientation``.
+
+    A3 landscape is 420 x 297 mm; the same sheet in portrait is 297 x 420 mm. The
+    table stores long/short edges only, so "A3" can never silently mean "420 square".
+    """
+    key = sheet.upper()
+    if key not in ISO_216_MM:
+        raise ValueError(f"Unsupported sheet {sheet!r}; choose {', '.join(sorted(ISO_216_MM))}")
+    if orientation not in ORIENTATIONS:
+        raise ValueError(f"Orientation must be one of {ORIENTATIONS}; received {orientation!r}")
+    long_edge, short_edge = ISO_216_MM[key]
+    return (long_edge, short_edge) if orientation == "landscape" else (short_edge, long_edge)
 
 
 @dataclass(frozen=True)
@@ -31,6 +50,7 @@ class SheetLayout:
     scale_bar_rect_mm: tuple[float, float, float, float]
     geometry_center_m: tuple[float, float]
     ground_extent_m: tuple[float, float]
+    orientation: str = "landscape"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,21 +62,25 @@ def resolve_layout(
     scale: int = 250,
     margin_mm: float = 10.0,
     titleblock_mm: tuple[float, float] = TITLEBLOCK_MM,
+    orientation: str = "landscape",
 ) -> SheetLayout:
-    """Resolve a centered, exact-scale landscape paper viewport.
+    """Resolve a centered, exact-scale ISO 216 paper viewport.
 
     Raises rather than silently stretching geometry when a requested scale cannot contain
     the supplied model bounds. Cartouche is fixed 180x50mm; scale bar is a true 50m bar.
+    ``orientation`` selects which ISO 216 edge is the page width; the cartouche and scale
+    bar always sit on the bottom edge, so portrait pages are laid out, not rotated after
+    the fact.
     """
     key = sheet.upper()
-    if key not in SHEETS:
+    if key not in ISO_216_MM:
         raise ValueError(f"Unsupported sheet {sheet!r}; choose A3, A1, or A0")
     if scale not in STANDARD_SCALES:
         raise ValueError(f"Scale must be one of {STANDARD_SCALES}")
     minx, miny, maxx, maxy = map(float, bounds_m)
     if not all(math.isfinite(v) for v in (minx, miny, maxx, maxy)) or maxx <= minx or maxy <= miny:
         raise ValueError("bounds_m must be a finite, non-empty (minx,miny,maxx,maxy) box")
-    paper_w, paper_h = SHEETS[key]
+    paper_w, paper_h = page_size(key, orientation)
     tb_w, tb_h = titleblock_mm
     usable_w = paper_w - 2 * margin_mm
     usable_h = paper_h - 2 * margin_mm - tb_h
@@ -88,15 +112,160 @@ def resolve_layout(
         scale_bar,
         (cx, cy),
         (ground_w, ground_h),
+        orientation,
     )
 
 
+@dataclass(frozen=True)
+class SheetPlacement:
+    """Exact-scale mapping from model metres to millimetres on one printed page.
+
+    A page at 1:N draws the ground at exactly ``1000/N`` millimetres per metre. Nothing
+    here fits content to the paper: the scale is fixed by the page declaration, and a
+    footprint either lands inside the usable area or is clipped. That distinction is the
+    whole difference between a true-to-scale plot and a picture of one.
+
+    ``custom`` exists for ``--sheet-mm`` runs that name no ISO sheet; it is catalogued as
+    a custom square page rather than mislabelled "A3".
+    """
+
+    sheet: str
+    orientation: str
+    page_w_mm: float
+    page_h_mm: float
+    scale: int
+    margin_mm: float
+    origin_mm: tuple[float, float]
+    content_m: tuple[float, float, float, float]
+    titleblock_mm: tuple[float, float] = TITLEBLOCK_MM
+
+    @property
+    def mm_per_m(self) -> float:
+        return 1000.0 / self.scale
+
+    @property
+    def usable_rect_mm(self) -> tuple[float, float, float, float]:
+        """Usable map area, as (x, y, w, h) from the page's bottom-left.
+
+        The cartouche band is reserved exactly as ``resolve_layout`` reserves it for the
+        DXF paper space. Both artifacts describe one page, so both must report the same
+        ground extent; a difference of 50 mm here is 50 m of ground at 1:1000.
+        """
+        tb_h = self.titleblock_mm[1]
+        return (
+            self.margin_mm,
+            self.margin_mm + tb_h,
+            self.page_w_mm - 2 * self.margin_mm,
+            self.page_h_mm - 2 * self.margin_mm - tb_h,
+        )
+
+    @property
+    def ground_extent_m(self) -> tuple[float, float]:
+        """Ground covered by the usable area at this denominator."""
+        _, _, w, h = self.usable_rect_mm
+        return w * self.scale / 1000.0, h * self.scale / 1000.0
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.page_w_mm / self.page_h_mm
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sheet": self.sheet,
+            "orientation": self.orientation,
+            "page_mm": {"width": self.page_w_mm, "height": self.page_h_mm},
+            "aspect_ratio": round(self.aspect_ratio, 6),
+            "scale": f"1:{self.scale}",
+            "mm_per_m": round(self.mm_per_m, 6),
+            "ground_extent_m": [round(v, 3) for v in self.ground_extent_m],
+            "usable_rect_mm": [round(v, 3) for v in self.usable_rect_mm],
+            "content_bounds_m": [round(v, 3) for v in self.content_m],
+        }
+
+
+def resolve_placement(
+    content_bounds_m: tuple[float, float, float, float],
+    *,
+    sheet: str = "A3",
+    scale: int = 500,
+    orientation: str = "landscape",
+    margin_mm: float = 10.0,
+    page_mm_override: tuple[float, float] | None = None,
+    titleblock_mm: tuple[float, float] = TITLEBLOCK_MM,
+) -> SheetPlacement:
+    """Place ``content_bounds_m`` on an ISO page at exactly 1:``scale``.
+
+    The content is centred on the page. It is never rescaled to fit: callers that need a
+    different fit must choose a different sheet or denominator.
+
+    ``page_mm_override`` exists for ``--sheet-mm`` runs that name no ISO sheet. Such a
+    page must be declared with ``sheet="custom"``; labelling a 420 mm square "A3" is the
+    defect this release removes.
+    """
+    if page_mm_override is not None:
+        if sheet.upper() != "CUSTOM":
+            raise ValueError("page_mm_override requires sheet='custom'")
+        page_w, page_h = (float(page_mm_override[0]), float(page_mm_override[1]))
+    else:
+        page_w, page_h = page_size(sheet, orientation)
+    if scale <= 0:
+        raise ValueError("Scale denominator must be positive")
+    minx, miny, maxx, maxy = map(float, content_bounds_m)
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    mm_per_m = 1000.0 / scale
+    tb_w, tb_h = titleblock_mm
+    usable_w = page_w - 2 * margin_mm
+    usable_h = page_h - 2 * margin_mm - tb_h
+    if usable_w <= 0 or usable_h <= 0:
+        raise ValueError("Margins/title block leave no usable map viewport")
+    if tb_w > usable_w:
+        raise ValueError("Title block is wider than the usable page width")
+    return SheetPlacement(
+        sheet=sheet.upper(),
+        orientation=orientation,
+        page_w_mm=page_w,
+        page_h_mm=page_h,
+        scale=int(scale),
+        margin_mm=float(margin_mm),
+        # Centre of the usable rect, expressed in the page's y-up convention: the map
+        # occupies margin + titleblock .. page_h - margin.
+        origin_mm=(
+            margin_mm + usable_w / 2.0 - cx * mm_per_m,
+            margin_mm + tb_h + usable_h / 2.0 + cy * mm_per_m,
+        ),
+        content_m=(minx, miny, maxx, maxy),
+        titleblock_mm=(float(tb_w), float(tb_h)),
+    )
+
+
+def coverage_bounds(
+    center_m: tuple[float, float], page: SheetPlacement, *, pad_m: float = 0.0
+) -> tuple[float, float, float, float]:
+    """Ground actually covered by ``page``, centred on ``center_m`` (a study-radius box).
+
+    Returns the smaller of the page area and the requested pad, so a small radius on a
+    large sheet is bounded by the radius, and a large radius on a small sheet is bounded
+    by the paper.
+    """
+    ground_w, ground_h = page.ground_extent_m
+    half_w = min(ground_w, 2 * pad_m) / 2.0 if pad_m else ground_w / 2.0
+    half_h = min(ground_h, 2 * pad_m) / 2.0 if pad_m else ground_h / 2.0
+    cx, cy = center_m
+    return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
 def resolve_sheet_set(
-    bounds_m: tuple[float, float, float, float], scales: dict[str, int] | None = None, margin_mm: float = 10.0
+    bounds_m: tuple[float, float, float, float],
+    scales: dict[str, int] | None = None,
+    margin_mm: float = 10.0,
+    orientation: str = "landscape",
 ) -> list[SheetLayout]:
     """Return explicitly-scaled A3/A1/A0 layouts; defaults use 1:250/1:500/1:1000."""
     scales = scales or {"A3": 250, "A1": 500, "A0": 1000}
-    return [resolve_layout(bounds_m, sheet, scales[sheet], margin_mm) for sheet in ("A3", "A1", "A0")]
+    return [
+        resolve_layout(bounds_m, sheet, scales[sheet], margin_mm, orientation=orientation)
+        for sheet in ("A3", "A1", "A0")
+    ]
 
 
 def metadata_from_utm(

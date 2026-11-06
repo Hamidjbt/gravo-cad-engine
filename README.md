@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.8.1. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.9.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,41 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## True print architecture (v1.9.0)
+
+The sheet used to be a 420 mm **square** named "A3" in the report. The defect was not one number: the
+square assumption was baked into six layers (`write_svg`, `mm_point`'s hardcoded 300 m half-extent,
+`render_sheet`, `_svg_findings`, `_png_findings`, and the reported `scale`), while
+`layout_engine.resolve_layout` — which already knew A3 is 420 × 297 and computed real ground extents —
+only ever reached the DXF.
+
+**One source of truth.** `layout_engine` owns ISO 216 geometry and everything that renders paper asks it.
+
+| sheet | landscape | portrait |
+|---|---|---|
+| A3 | 420 × 297 mm | 297 × 420 mm |
+| A1 | 841 × 594 mm | 594 × 841 mm |
+| A0 | 1189 × 841 mm | 841 × 1189 mm |
+
+Select orientation with `--orientation` (CLI) or `orientation` (MCP).
+
+**Scale is declared, never fitted.** A page at 1:N draws ground at exactly `1000/N` mm per metre; content
+is *positioned* inside the usable area and clipped to it. Nothing is rescaled to fit — that would be the
+same defect in a new costume.
+
+**The raster and the paper space are one page.** `SheetPlacement` reserves the cartouche band exactly as
+the DXF paper space does, so both report the same ground extent for the same sheet, scale and orientation
+(verified for all six sheet/orientation combinations).
+
+**QA enforces aspect ratio.** `_svg_findings` compares both edges against the declared page and rejects a
+square page for a rectangular sheet; `_png_findings` compares both axes; the builder additionally asserts
+the raster's aspect ratio against the page.
+
+**Honest reporting.** `report["scale"]` is the layout's denominator, `paper_layouts.sheet` describes the
+page, and `paper_layouts.scale_consistent` says whether the page actually covers the requested radius.
+A request that cannot fit is refused with a message naming the sheet and denominator, not silently
+stretched. Layout-less runs keep the legacy square sheet, catalogued as `custom` rather than "A3".
 
 ## Authoritative invariant (v1.8.1)
 
