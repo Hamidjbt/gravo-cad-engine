@@ -216,7 +216,47 @@ report declares — without it a portrait run produced a portrait report next to
 
 Validated on the live Tlemcen case: A0 1:1000 in both orientations, and a documented refusal for A3 1:500
 and A1 1:1000, which cannot hold a 600 m site. Measured output: 14043 × 9933 px at 300 dpi = 1189 × 841 mm
-exactly, at a uniform 11.811 px/mm.
+exactly, at a uniform 11.811 mm scaling.
+
+### Phase 12 — Artifact egress pipeline (1.10.0)
+
+Rendering a true A0 sheet at 300 dpi produces roughly 13 MB of raster alone. In a workspace with a hard
+persistent-quota ceiling, "render it, then delete it" is a workaround that quietly caps the engine: the
+larger the sheet, the more likely the write itself fails. `tools/egress_manager.py` removes artifact
+*retention* from the monitored tree instead of removing resolution from the renderer.
+
+- **`ArtifactEgress`** is a context manager that owns a private buffer under
+  `/var/tmp/gravo_egress_buffer/<run_id>/`. It refuses to construct if the buffer root resolves inside
+  `/home/user`, so the invariant cannot be broken by configuration.
+- **Registration is path-checked.** `register()` rejects any artifact that does not resolve inside the
+  buffer, so a stray write elsewhere is an error rather than a silent leak.
+- **Flush verifies bytes.** Each artifact is streamed to a sink, and the remote byte count must equal the
+  local one; a mismatch fails the run rather than recording a false success.
+- **Purge is unconditional.** `__exit__` removes the buffer on the success path *and* the exception path,
+  then verifies it is gone.
+- **The receipt is the only durable trace**: `home/<run_id>_receipt.json` holds remote URIs, per-file
+  chunk counts, SHA256 checksums, a self-checksum, and the measured workspace delta. It is written `0444`
+  and refuses to overwrite an existing receipt.
+
+Sinks are pluggable: `GoogleDriveSink` (googleapiclient, `MediaFileUpload` in resumable mode),
+`ResumableSessionSink` (streams over pre-authorized Drive session URIs with plain HTTP so a
+credential-less environment can still egress), `LocalDirectorySink` (CI/offline verification), and
+`NullSink`.
+
+One service constraint was learned the hard way and is now encoded rather than assumed: a multi-chunk
+resumable session **must** declare its total size when created. Attempting an undeclared 900 kB upload
+was rejected with HTTP 400, *"not a multiple of the 262144 byte chunk granularity"*. Consequences:
+
+- `ResumableSessionSink` requires a declared total for any artifact larger than one chunk, and refuses a
+  declared total that contradicts the artifact's real size.
+- The report embeds its own egress block and therefore grows while describing itself, which made its
+  final size unpredictable. It is now padded to a fixed `REPORT_BLOCK_BYTES` (256 KiB) block: trailing
+  JSON whitespace is insignificant, and the announced and delivered sizes then agree by construction.
+
+Validated live on the Tlemcen case: A0 1:1000, radius 300 m, 404 buildings, `ok: true`, `findings: []`.
+Six artifacts totalling **15,444,614 bytes** streamed to `Gravo_CAD_Deliverables/v1.10.0/` — the 12.7 MB
+raster alone took 49 chunks — with `workspace delta: 0 bytes` and the buffer purged on exit.
+
 
 ---
 
@@ -367,10 +407,10 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.9.0**.
+- Skill/manifest version: **1.10.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
-- Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.
+- Latest full regression run: **306 passed**; `make lint` clean on 26 files; mypy clean.
 - Validated A3 artifacts are protected and remain in `/home/user/site-plan/`.
 - Full generation/render/export was intentionally not run during this engineering upgrade.
 - Quota recovery left `/home/user` at **378 files / 43M** (target: <500 files / <100MB); filesystem use is 17%. The validated A3 SVG/PDF and all critical skill source remain. At the pre-cleanup inventory, only the A3 SVG and PDF were present; no A3 300-dpi PNG existed in `site-plan`, and none was removed.

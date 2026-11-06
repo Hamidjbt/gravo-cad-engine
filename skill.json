@@ -1,6 +1,6 @@
 {
   "name": "cad-fond-de-plan",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Create a metric monochrome architectural Fond de Plan from OSM, Microsoft footprints, and a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms.",
   "type": "custom",
   "skill_md": "SKILL.md",

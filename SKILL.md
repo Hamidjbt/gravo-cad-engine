@@ -2,7 +2,7 @@
 name: cad-fond-de-plan
 description: "Use when creating a metric monochrome Fond de Plan from OSM, Microsoft footprints, or a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms."
 metadata:
-  version: "1.9.0"
+  version: "1.10.0"
   tags: "geospatial, gis, cad, dxf, osm, urban-planning"
   triggers: "fond de plan, cadastral base map, building footprints to DXF, road casement, architectural site plan"
 ---

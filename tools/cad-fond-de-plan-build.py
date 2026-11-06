@@ -24,6 +24,7 @@ import pandas as pd
 import requests
 import svgwrite
 from deliverable_qa import DRAWING_DELIVERABLES, qa_output_directory
+from egress_manager import ArtifactEgress, EgressError, egress_report_block, resolve_sink
 from footprint_providers import (
     OSM_ATTRIBUTION,
     BaseFootprintProvider,
@@ -55,7 +56,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.9.0"
+ENGINE_VERSION = "1.10.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -1145,9 +1146,78 @@ def regularize_footprint_records(records: list[FootprintRecord], site: Polygon, 
     return topology, output_sources, conservative_fallbacks, vacant_site_false_positives
 
 
-def build(args) -> dict:
+def build(args, egress: ArtifactEgress | None = None) -> dict:
+    """Build the deliverable, routing heavy artifacts through ``egress`` if supplied.
+
+    ``build`` itself never decides where artifacts live. With an egress manager the
+    output directory is the manager's scratch buffer, so the monitored tree sees no
+    artifact bytes; without one the caller's ``--output`` is used directly.
+    """
+    if egress is not None:
+        return _build_with_egress(args, egress)
+    return _build_core(args, Path(args.output).expanduser().resolve())
+
+
+def _build_with_egress(args, egress: ArtifactEgress) -> dict:
+    """Run the build inside an egress context: buffer in, receipt out, nothing else.
+
+    The report is flushed *last* so the copy that lands remotely describes remote
+    locations: flushing it first would upload a document pointing at a scratch
+    directory that no longer exists by the time anyone reads it.
+    """
+    out_dir = egress.output_dir("artifacts")
+    report = _build_core(args, out_dir)
+    milestone = egress.milestone or "artifacts"
+
+    heavy = [name for name in _deliverable_names(out_dir) if name != "fond-de-plan-report.json"]
+    for name in heavy:
+        egress.register(out_dir / name, logical_name=f"{milestone}/{name}")
+    egress.register_tree(out_dir / "source", prefix=f"{milestone}/source/")
+    egress.flush()
+
+    report["outputs"] = {name: egress.uri_map().get(f"{milestone}/{name}", "") for name in heavy}
+    report["egress"] = egress_report_block(egress)
+
+    report_path = out_dir / "fond-de-plan-report.json"
+    if report_path.is_file():
+        body = json.dumps(report, indent=2).encode("utf-8")
+        if len(body) > REPORT_BLOCK_BYTES:
+            raise EgressError(
+                f"report is {len(body)} bytes, larger than the {REPORT_BLOCK_BYTES}-byte egress block; "
+                "raise REPORT_BLOCK_BYTES so the declared upload size stays predictable"
+            )
+        # Trailing JSON whitespace is insignificant, so padding is safe for consumers.
+        report_path.write_bytes(body + b" " * (REPORT_BLOCK_BYTES - len(body)))
+        egress.register(report_path, logical_name=f"{milestone}/fond-de-plan-report.json")
+        egress.flush()
+        report["outputs"]["fond-de-plan-report.json"] = egress.uri_map().get(
+            f"{milestone}/fond-de-plan-report.json", ""
+        )
+    return report
+
+
+#: The report is padded to this exact size before egress. A resumable upload session
+#: must declare its byte total up front, but the report embeds its own egress block and
+#: therefore grows while the run is still describing itself. Padding to a fixed block
+#: makes the announced size and the delivered size agree by construction.
+REPORT_BLOCK_BYTES = 256 * 1024
+
+
+def _deliverable_names(out_dir: Path) -> list[str]:
+    """Names of the heavy deliverables, in a stable order, that exist on disk."""
+    candidates = [
+        "fond-de-plan-hollow.svg",
+        "fond-de-plan-hatched.svg",
+        "fond-de-plan-cad.dxf",
+        "fond-de-plan-sheet-300dpi.png",
+        "fond-de-plan-sheet-300dpi.pdf",
+        "fond-de-plan-report.json",
+    ]
+    return [name for name in candidates if (out_dir / name).is_file()]
+
+
+def _build_core(args, out_dir: Path) -> dict:
     generated_at_utc = datetime.now(UTC).isoformat(timespec="seconds")
-    out_dir = Path(args.output).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "source").mkdir(exist_ok=True)
     if args.maps_url:
@@ -1592,6 +1662,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum automatic download size per Google tile; larger tiles require a supplied cache",
     )
     p.add_argument("--output", default=str(Path.home() / "site-plan"))
+    p.add_argument(
+        "--egress",
+        choices=("none", "gdrive", "local", "null"),
+        default="none",
+        help="route heavy artifacts through the egress pipeline instead of --output (default: none)",
+    )
+    p.add_argument("--egress-milestone", default=None, help="Drive folder label for this run, e.g. v1.10.0")
+    p.add_argument("--egress-run-id", default=None, help="stable run identifier; defaults to a UTC timestamp")
+    p.add_argument(
+        "--egress-receipt-dir",
+        default=str(Path.home()),
+        help="directory for the single <run_id>_receipt.json (default: the monitored root)",
+    )
+    p.add_argument(
+        "--egress-sessions-json",
+        default=None,
+        help=(
+            "JSON file mapping logical artifact name to a pre-authorized Drive resumable "
+            "session URI; used where no in-process Drive credentials exist"
+        ),
+    )
+    p.add_argument(
+        "--egress-file-ids-json",
+        default=None,
+        help="JSON file mapping logical artifact name to its Drive file id, for receipt URIs",
+    )
+    p.add_argument(
+        "--egress-sizes-json",
+        default=None,
+        help="JSON file mapping logical artifact name to the byte total declared when its session opened",
+    )
+    p.add_argument(
+        "--egress-local-root",
+        default=None,
+        help="destination directory for --egress local; must be outside the monitored tree",
+    )
     p.add_argument("--sheet-mm", type=float, default=420.0)
     p.add_argument("--layout-sheet", choices=("A3", "A1", "A0"), help="add one exact-scale paper-space layout")
     p.add_argument(
@@ -1637,27 +1743,78 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _load_json_map(path: str | None) -> dict[str, str]:
+    """Load a name->value JSON map, rejecting anything that is not a flat mapping."""
+    if not path:
+        return {}
+    payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object in {path}")
+    return {str(key): str(value) for key, value in payload.items()}
+
+
+def _load_json_int_map(path: str | None) -> dict[str, int]:
+    """Load a name->integer map (declared byte totals must stay integers)."""
+    if not path:
+        return {}
+    payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object in {path}")
+    return {str(key): int(value) for key, value in payload.items()}
+
+
+def run_with_egress(args) -> dict:
+    """Execute the build inside an ArtifactEgress context and return the report."""
+    sink = None
+    if args.egress == "local":
+        if not args.egress_local_root:
+            raise ValueError("--egress local requires --egress-local-root outside the monitored tree")
+        sink = resolve_sink("local", local_root=Path(args.egress_local_root).expanduser())
+    elif args.egress in {"gdrive", "null"}:
+        sink = resolve_sink(
+            args.egress,
+            sessions=_load_json_map(args.egress_sessions_json),
+            file_ids=_load_json_map(args.egress_file_ids_json),
+            declared_sizes=_load_json_int_map(args.egress_sizes_json),
+        )
+    with ArtifactEgress(
+        destination=args.egress,
+        milestone=args.egress_milestone,
+        run_id=args.egress_run_id,
+        receipt_dir=Path(args.egress_receipt_dir).expanduser(),
+        sink=sink,
+        sessions=_load_json_map(args.egress_sessions_json),
+        file_ids=_load_json_map(args.egress_file_ids_json),
+        declared_sizes=_load_json_int_map(args.egress_sizes_json),
+    ) as egress:
+        return build(args, egress=egress)
+
+
 def main() -> int:
     p = build_parser()
     a = p.parse_args()
     if a.layout_scale and not a.layout_sheet:
         p.error("--layout-scale requires --layout-sheet")
     try:
-        result = build(a)
+        result = run_with_egress(a) if a.egress != "none" else build(a)
         print(
             json.dumps(result, indent=2)
             if a.json
             else json.dumps(
                 {
                     "ok": result["ok"],
-                    "output": a.output,
+                    "output": result.get("outputs", a.output),
                     "buildings": result["building_regularization"]["output_buildings"],
                     "epsg": result["center"]["epsg"],
                     "findings": result["findings"],
+                    "egress": result.get("egress"),
                 }
             )
         )
         return 0 if result["ok"] else 1
+    except EgressError as exc:
+        print(json.dumps({"ok": False, "error": f"EgressError: {exc}"}, indent=2))
+        return 1
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2))
         return 1

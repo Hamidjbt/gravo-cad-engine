@@ -452,12 +452,14 @@ def test_warnings_only_claim_the_overpass_fallback_when_it_happened():
 def test_attribution_omits_a_user_aerial_without_one():
     """D4: a print deliverable must not credit an aerial that was never supplied.
 
-    Builds the attribution string the same way ``build()`` does, with and without
+    Builds the attribution string the same way the build core does, with and without
     an image, and asserts the suffix tracks the input rather than being constant.
     """
     import inspect
 
-    source = inspect.getsource(build.build)
+    # v1.10.0: the build body moved into _build_core so that build() can wrap it in
+    # an egress context; the attribution logic itself is unchanged.
+    source = inspect.getsource(build._build_core)
     assert 'attribution = f"{OSM_ATTRIBUTION}; {provider.attribution}"' in source
     assert 'attribution += "; reference aerial supplied by user."' in source
     assert "if image_path:\n        attribution +=" in source

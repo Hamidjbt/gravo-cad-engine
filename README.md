@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.9.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.10.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,25 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## Artifact egress pipeline (v1.10.0)
+
+Heavy artifacts never touch the monitored workspace. `tools/egress_manager.py` provides an I/O abstraction
+whose buffer lives under `/var/tmp/gravo_egress_buffer/<run_id>/`; on context exit it streams every
+artifact to Google Drive, purges the buffer on both the success and exception paths, and leaves a single
+immutable `<run_id>_receipt.json` holding remote URIs, per-file chunk counts and SHA256 checksums.
+
+```bash
+# Stream A0 deliverables straight to Drive; nothing durable is written locally.
+cad-fond-de-plan-build.py --lat 34.8754565 --lon -1.2948622 --radius 300 \
+  --layout-sheet A0 --layout-scale 1000 --orientation landscape \
+  --egress gdrive --egress-milestone v1.10.0 --egress-run-id my-run \
+  --egress-sessions-json sessions.json --egress-sizes-json sizes.json
+```
+
+Sinks: `gdrive` (resumable session URIs, or a Drive service object), `local` (a directory outside the
+monitored tree, for CI), and `null` (lifecycle verification). Rendering capability is unchanged: the
+engine still produces full A0/A1 sheets at 300 dpi; only their location moves.
 
 ## True print architecture (v1.9.0)
 
