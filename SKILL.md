@@ -2,7 +2,7 @@
 name: cad-fond-de-plan
 description: "Use when creating a metric monochrome Fond de Plan from OSM, Microsoft footprints, or a supplied reference image; export SVG/DXF/PDF/PNG and A3 zooms."
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
   tags: "geospatial, gis, cad, dxf, osm, urban-planning"
   triggers: "fond de plan, cadastral base map, building footprints to DXF, road casement, architectural site plan"
 ---
@@ -43,6 +43,7 @@ Use direct `VENV/bin/python PATH/TO/tool.py` if launchers are not on `PATH`. Ins
 Ask for the map link or coordinates, radius/extent, aerial image, any surveyed/GCP control and its pixel convention, desired page/scale, and existing OSM/Microsoft caches. If scale or control is unknown, state uncertainty and ask whether an estimate is acceptable. Confirm whether the requested deliverable is a new base map or a read-only layout derivative. Never infer legal parcel lines from imagery; distinguish traced site boundary from authoritative cadastral data.
 
 ## Tools
+- `tools/acquisition.py`: shared cache/download/integrity mechanics plus declared `SourceCapabilities` per footprint source; publish capabilities rather than branching on provider name.
 - `tools/deliverable_qa.py`: the single QA contract used by the builder, `check.py`, and MCP `verify_topology`; carry `qa_contract_version` with any verdict.
 - `tools/report_schema.py`: report schema version, input digests, `summary`/`full` detail trimming, determinism comparison.
 - `tools/cad-fond-de-plan-build.py`: base-map build and R2018 DXF architecture; see `--help` for parameters.

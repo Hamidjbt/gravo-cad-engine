@@ -12,15 +12,18 @@ import csv
 import gzip
 import json
 import math
-import os
-import tempfile
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import requests
+from acquisition import (
+    AcquisitionError,
+    AcquisitionLayer,
+    RemoteTile,
+    SourceCapabilities,
+)
 from pyproj import Transformer
 from shapely import make_valid, wkt
 from shapely import transform as shapely_transform
@@ -31,6 +34,9 @@ from shapely.strtree import STRtree
 MS_INDEX = "https://bfppub.blob.core.windows.net/$web/2026-07-24/dataset-links.csv"
 OB_TILES_URL = "https://openbuildings-public-dot-gweb-research.uw.r.appspot.com/public/tiles.geojson"
 OB_SCORE_THRESHOLDS_URL = "https://storage.googleapis.com/open-buildings-data/v3/score_thresholds_s2_level_4.csv"
+THRESHOLDS_FILENAME = "google-open-buildings-score-thresholds.csv"
+THRESHOLDS_MAX_MB = 100.0
+TILES_INDEX_FILENAME = "google-open-buildings-tiles.geojson"
 OB_ATTRIBUTION = "Google Open Buildings v3 (CC BY 4.0 or ODbL 1.0)"
 RESOLUTION_BASELINE = "baseline-min-confidence"
 RESOLUTION_REGIONAL = "regional-s2-cell-threshold"
@@ -196,6 +202,26 @@ class MicrosoftFootprintProvider(BaseFootprintProvider):
 
     name = "microsoft"
     attribution = MS_ATTRIBUTION
+    capabilities = SourceCapabilities(
+        source_id="microsoft",
+        display_name="Microsoft Global ML Building Footprints",
+        license_id="CDLA-Permissive-2.0",
+        supports_remote_discovery=True,
+        supports_local_cache=True,
+        supports_directory_cache=False,
+        supports_size_limit=True,
+        supports_confidence_scores=True,
+        supports_precision_thresholds=False,
+        supports_streaming=True,
+        accepted_suffixes=(".csv.gz", ".gz", ".geojsonl", ".csv"),
+        notes=(
+            "Quadkey-indexed global release; an Algeria location filter is applied.",
+            "Compressed GeoJSON-L per line; no per-cell precision tiers published.",
+        ),
+    )
+
+    def _layer(self, out_dir: Path) -> AcquisitionLayer:
+        return AcquisitionLayer(self.capabilities, cache_dir=out_dir / "source")
 
     def acquire(
         self,
@@ -206,15 +232,14 @@ class MicrosoftFootprintProvider(BaseFootprintProvider):
         local_file: Path | None = None,
     ) -> tuple[list[Path], str]:
         del radius_m
+        layer = self._layer(out_dir)
         if local_file:
-            return [local_file], f"local Microsoft footprint tile: {local_file}"
-        src_dir = out_dir / "source"
-        src_dir.mkdir(parents=True, exist_ok=True)
-        index_path = src_dir / "microsoft-dataset-links.csv"
-        if not index_path.exists():
-            response = requests.get(MS_INDEX, timeout=180, headers={"User-Agent": "cad-fond-de-plan/1.0"})
-            response.raise_for_status()
-            index_path.write_bytes(response.content)
+            paths = layer.local_paths(local_file)
+            return paths, "local Microsoft footprint tile: " + ", ".join(p.name for p in paths)
+
+        index_path = layer.cached("microsoft-dataset-links.csv") or layer.fetch_index(
+            RemoteTile(url=MS_INDEX, filename="microsoft-dataset-links.csv", label="Microsoft dataset index")
+        )
         import pandas as pd
 
         links = pd.read_csv(index_path, dtype={"QuadKey": str})
@@ -231,12 +256,13 @@ class MicrosoftFootprintProvider(BaseFootprintProvider):
         if matches.empty:
             raise RuntimeError(f"No Microsoft building tile found for quadkey {target}; provide --microsoft-file")
         row = matches.iloc[0]
-        tile_path = src_dir / f"microsoft-{row['Location']}-{row['QuadKey']}.csv.gz"
-        if not tile_path.exists():
-            response = requests.get(row["Url"], timeout=240, headers={"User-Agent": "cad-fond-de-plan/1.0"})
-            response.raise_for_status()
-            tile_path.write_bytes(response.content)
-        return [tile_path], (
+        tile = RemoteTile(
+            url=str(row["Url"]),
+            filename=f"microsoft-{row['Location']}-{row['QuadKey']}.csv.gz",
+            label=f"quadkey {row['QuadKey']}",
+        )
+        path = layer.fetch(tile, integrity="gzip")
+        return [path], (
             f"Microsoft Global ML Building Footprints, {row['Location']} quadkey {row['QuadKey']} ({row['Url']})"
         )
 
@@ -419,6 +445,24 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
     name = "google-open-buildings"
     attribution = OB_ATTRIBUTION
     default_min_confidence = 0.65
+    capabilities = SourceCapabilities(
+        source_id="google-open-buildings",
+        display_name="Google Open Buildings v3",
+        license_id="CC-BY-4.0 OR ODbL-1.0",
+        default_min_confidence=0.65,
+        supports_remote_discovery=True,
+        supports_local_cache=True,
+        supports_directory_cache=True,
+        supports_size_limit=True,
+        supports_confidence_scores=True,
+        supports_precision_thresholds=True,
+        supports_streaming=True,
+        accepted_suffixes=(".csv.gz", ".csv"),
+        notes=(
+            "S2 spatially sharded CSV tiles with per-feature confidence and plus codes.",
+            "Publishes per-S2-cell thresholds for estimated 80/85/90% precision.",
+        ),
+    )
 
     def __init__(self, max_download_mb: float = 250.0) -> None:
         if max_download_mb <= 0:
@@ -438,6 +482,9 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
             raise ValueError("Google Open Buildings input must be a .csv, .csv.gz, or directory of tile files")
         return [path]
 
+    def _layer(self, out_dir: Path) -> AcquisitionLayer:
+        return AcquisitionLayer(self.capabilities, cache_dir=out_dir / "source", max_download_mb=self.max_download_mb)
+
     def acquire_thresholds(self, out_dir: Path, local_path: Path | None = None) -> tuple[Path | None, str]:
         """Use an explicit/local cached thresholds CSV, otherwise download and cache it.
 
@@ -449,25 +496,23 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
             if not path.is_file():
                 raise FileNotFoundError(f"Google score-threshold CSV does not exist: {path}")
             return path, f"local-thresholds-csv:{path}"
-        cache_path = out_dir / "source" / "google-open-buildings-score-thresholds.csv"
-        if cache_path.is_file():
-            return cache_path, f"cached-thresholds-csv:{cache_path}"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        layer = self._layer(out_dir)
+        cached = layer.cached(THRESHOLDS_FILENAME)
+        if cached is not None:
+            return cached, f"cached-thresholds-csv:{cached}"
         try:
-            response = requests.get(
-                OB_SCORE_THRESHOLDS_URL,
-                timeout=120,
-                headers={"User-Agent": "cad-fond-de-plan/1.0"},
+            path = layer.fetch(
+                RemoteTile(
+                    url=OB_SCORE_THRESHOLDS_URL,
+                    filename=THRESHOLDS_FILENAME,
+                    label="Google score thresholds",
+                ),
+                integrity="none",
+                max_download_mb=THRESHOLDS_MAX_MB,
             )
-            response.raise_for_status()
-            if len(response.content) > 100 * 1024 * 1024:
-                return None, "thresholds-download-exceeded-100-MB-safety-limit"
-            temp_path = cache_path.with_suffix(cache_path.suffix + ".part")
-            temp_path.write_bytes(response.content)
-            temp_path.replace(cache_path)
-            return cache_path, f"downloaded-thresholds-csv:{cache_path}"
-        except (requests.RequestException, OSError) as error:
-            return None, f"thresholds-unavailable:{type(error).__name__}"
+            return path, f"downloaded-thresholds-csv:{path}"
+        except AcquisitionError as error:
+            return None, f"thresholds-unavailable:{error}"
 
     def acquire(
         self,
@@ -477,17 +522,14 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
         out_dir: Path,
         local_file: Path | None = None,
     ) -> tuple[list[Path], str]:
+        layer = self._layer(out_dir)
         if local_file is not None:
-            paths = self._local_paths(local_file)
+            paths = layer.local_paths(local_file)
             return paths, "local Google Open Buildings v3 cached tile(s): " + ", ".join(p.name for p in paths)
 
-        source_dir = out_dir / "source"
-        source_dir.mkdir(parents=True, exist_ok=True)
-        index_path = source_dir / "google-open-buildings-tiles.geojson"
-        if not index_path.exists():
-            response = requests.get(OB_TILES_URL, timeout=120, headers={"User-Agent": "cad-fond-de-plan/1.0"})
-            response.raise_for_status()
-            index_path.write_bytes(response.content)
+        index_path = layer.cached(TILES_INDEX_FILENAME) or layer.fetch_index(
+            RemoteTile(url=OB_TILES_URL, filename=TILES_INDEX_FILENAME, label="Google tiles metadata")
+        )
         index = json.loads(index_path.read_text(encoding="utf-8"))
 
         # A geographic rectangle enclosing the metric search circle is sufficient to
@@ -512,58 +554,28 @@ class GoogleOpenBuildingsProvider(BaseFootprintProvider):
         for tile in selected:
             tile_url = str(tile["tile_url"])
             tile_id = str(tile.get("tile_id", Path(tile_url).name.split("_", 1)[0]))
-            path = source_dir / f"google-open-buildings-{tile_id}_buildings.csv.gz"
-            if not path.exists():
-                size_mb = float(tile.get("size_mb") or 0.0)
-                if size_mb > self.max_download_mb:
-                    raise RuntimeError(
-                        f"Google Open Buildings tile {tile_id} is {size_mb:.1f} MB, above the "
-                        f"{self.max_download_mb:.1f} MB download limit; download/cache it separately "
-                        "and pass --google-open-buildings-file"
-                    )
-                self._download_tile(tile_url, path)
-            paths.append(path)
+            size_mb = float(tile.get("size_mb") or 0.0)
+            if size_mb > self.max_download_mb:
+                raise RuntimeError(
+                    f"Google Open Buildings tile {tile_id} is {size_mb:.1f} MB, above the "
+                    f"{self.max_download_mb:.1f} MB download limit; download/cache it separately "
+                    "and pass --google-open-buildings-file"
+                )
+            paths.append(
+                layer.fetch(
+                    RemoteTile(
+                        url=tile_url,
+                        filename=f"google-open-buildings-{tile_id}_buildings.csv.gz",
+                        expected_size_mb=size_mb or None,
+                        label=f"tile {tile_id}",
+                    ),
+                    integrity="gzip",
+                )
+            )
         source = "Google Open Buildings v3 spatially-sharded polygon tile(s): " + ", ".join(
             str(tile.get("tile_id", "unknown")) for tile in selected
         )
         return paths, source
-
-    def _download_tile(self, url: str, destination: Path) -> None:
-        """Stream a tile to a temporary file and atomically cache the completed gzip."""
-        max_bytes = int(self.max_download_mb * 1024 * 1024)
-        response = requests.get(
-            url,
-            timeout=240,
-            headers={"User-Agent": "cad-fond-de-plan/1.0"},
-            stream=True,
-        )
-        response.raise_for_status()
-        header_size = response.headers.get("Content-Length")
-        if header_size and int(header_size) > max_bytes:
-            response.close()
-            raise RuntimeError(
-                f"Google Open Buildings tile exceeds the {self.max_download_mb:.1f} MB download limit; "
-                "provide a pre-downloaded cache file instead"
-            )
-        fd, temp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".part", dir=destination.parent)
-        os.close(fd)
-        temp_path = Path(temp_name)
-        received = 0
-        try:
-            with response, temp_path.open("wb") as stream:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    received += len(chunk)
-                    if received > max_bytes:
-                        raise RuntimeError(
-                            f"Google Open Buildings tile exceeds the {self.max_download_mb:.1f} MB download limit; "
-                            "provide a pre-downloaded cache file instead"
-                        )
-                    stream.write(chunk)
-            temp_path.replace(destination)
-        finally:
-            temp_path.unlink(missing_ok=True)
 
     def read(
         self,
@@ -672,6 +684,12 @@ def quadkey(lat: float, lon: float, zoom: int = 9) -> str:
     return "".join(result)
 
 
+PROVIDER_CLASSES: dict[str, type[BaseFootprintProvider]] = {
+    "microsoft": MicrosoftFootprintProvider,
+    "google-open-buildings": GoogleOpenBuildingsProvider,
+}
+
+
 def get_footprint_provider(name: str, max_google_download_mb: float = 250.0) -> BaseFootprintProvider:
     """Create the requested provider; Microsoft remains the backwards-compatible default."""
     if name == "microsoft":
@@ -679,3 +697,12 @@ def get_footprint_provider(name: str, max_google_download_mb: float = 250.0) -> 
     if name == "google-open-buildings":
         return GoogleOpenBuildingsProvider(max_google_download_mb)
     raise ValueError(f"Unsupported footprint provider: {name}")
+
+
+def provider_capabilities() -> dict[str, dict[str, Any]]:
+    """Declared capabilities of every registered source, for reports and tooling.
+
+    Callers and agents read this instead of inferring behaviour from provider
+    names, so a new source is discoverable without changing the consumer.
+    """
+    return {name: cls.capabilities.to_dict() for name, cls in PROVIDER_CLASSES.items()}

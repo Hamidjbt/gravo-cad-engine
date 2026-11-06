@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.5.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.6.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,29 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## Acquisition layer (v1.6.0)
+
+`tools/acquisition.py` owns the mechanics that every footprint source needs: local-file and
+directory handling, index and tile caching, atomic writes, per-object size limits, and post-download
+integrity checks. Providers no longer touch `requests`, temporary files, or cache semantics.
+
+Behaviour is governed by declared capabilities rather than by provider-name branching. Each source
+publishes a `SourceCapabilities` record covering licence, default confidence, remote discovery,
+local and directory caches, size limits, streaming, accepted suffixes, and whether it publishes
+precision tiers. Unsupported operations fail with a message derived from that record, and
+`provider_capabilities()` exposes the whole matrix to tooling and agents — it is echoed in the
+report's `footprints.capabilities` and in MCP `list_supported_formats.source_capabilities`.
+
+Divergences this removed: Microsoft previously buffered entire tiles in memory with no size cap and
+no integrity check, while Google streamed with a cap. Both now stream, both are capped
+(Google by `--google-max-download-mb`, Microsoft by the layer default), and both are gzip-verified
+before entering the cache.
+Partial downloads can no longer become visible: bytes land in a `.part` file and are renamed only
+after every check passes.
+
+Adding a source now means declaring capabilities and implementing `plan()`. `tests/test_acquisition.py`
+demonstrates this with a `StubSource` that requires no changes to the layer.
 
 ## MCP server
 

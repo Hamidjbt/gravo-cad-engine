@@ -1,6 +1,6 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.5.0  
+**Current release:** 1.6.0  
 **Last updated:** 2026-11-05  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
@@ -92,6 +92,21 @@ Phase 5 added provider capability that the agent-facing MCP surface could not re
 - **Versioned report schema.** `report_schema.py` owns `report_schema_version` (`1.0`), `engine_version`, `generated_at_utc`, sha256 digests for footprint sources, the thresholds CSV, and cached OSM input, plus effective build parameters. `--report-detail summary` replaces `output_provenance` and `source_feature_thresholds` with count-bearing omission records; `full` remains the default.
 - **MCP surface parity.** `generate_cad_plan` gained `footprint_provider`, `footprint_file`, `osm_file`, `study_radius_m`, `google_min_confidence`, `google_target_precision`, and `google_thresholds_file`, and returns the resolved provider, confidence policy, applied thresholds, and S2 cell IDs. A precision tier requires the Google provider and a cached thresholds CSV, so a tool call cannot silently trigger a mid-run dataset download.
 - **CI gate.** `.github/workflows/ci.yml` runs `make test` then `make lint` on push and pull request.
+
+### Phase 7 — Shared acquisition layer (1.6.0)
+
+By v1.5.0 the two providers each owned a private copy of acquisition mechanics, and the copies had already diverged: Microsoft buffered whole tiles in memory with no size ceiling and no integrity check, while Google streamed with a `max_download_mb` cap and atomic writes. A third source would have produced a third variant.
+
+Release **1.6.0** introduces `tools/acquisition.py`:
+
+- **`SourceCapabilities`** — a declared, serializable record per source (licence, default confidence, remote discovery, local/directory cache, size limits, streaming, accepted suffixes, precision-tier support). `require()` turns a missing capability into an explicit `CapabilityError` instead of silent behaviour.
+- **`AcquisitionLayer`** — one implementation of local resolution, cache probing, atomic `.part` → final rename, streaming and buffered transfers, byte ceilings checked against declared size, `Content-Length`, and the running count, plus `gzip`/`sha256`/`none` integrity modes. Statistics: `DownloadLimitExceeded`, `IntegrityError`, `AcquisitionError`.
+- **`TilePlan` / `RemoteTile`** — providers describe *what* to fetch; the layer decides *how*.
+- **`AcquisitionSource`** — the extension point. A new provider implements `plan()` only.
+
+`MicrosoftFootprintProvider` and `GoogleOpenBuildingsProvider` were rewritten onto this layer; both lost their private download code and their `requests`/`tempfile` imports. `provider_capabilities()` publishes the matrix, which now appears in the report (`footprints.capabilities`) and in MCP `list_supported_formats.source_capabilities`.
+
+A test-only `StubSource` proves the extension point: a third provider needs no edits to the layer.
 
 ---
 
@@ -242,7 +257,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.5.0**.
+- Skill/manifest version: **1.6.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.

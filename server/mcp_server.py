@@ -115,6 +115,7 @@ class SupportedFormats(BaseModel):
     scales: list[str]
     footprint_providers: list[str]
     target_precisions: list[int]
+    source_capabilities: dict[str, dict[str, object]] = Field(default_factory=dict)
 
 
 def _builder_path() -> Path:
@@ -359,13 +360,25 @@ def verify_topology(
 
 @mcp.tool()
 def list_supported_formats() -> SupportedFormats:
-    """List available drawing, print, sheet, scale, and provider options."""
+    """List drawing, print, sheet, scale, and provider options with declared capabilities."""
+    capabilities: dict[str, dict[str, object]] = {}
+    stub = _TOOLS_ROOT / "footprint_providers.py"
+    if stub.is_file():
+        spec = importlib.util.spec_from_file_location("mcp_footprint_providers", stub)
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+                capabilities = module.provider_capabilities()
+            except Exception:  # noqa: BLE001 - capabilities are advisory metadata
+                capabilities = {}
     return SupportedFormats(
         formats=["DXF R2018", "SVG", "PDF", "PNG (300 dpi)"],
         sheets=["A3 landscape", "A1 landscape", "A0 landscape"],
         scales=["1:250", "1:500", "1:1000"],
         footprint_providers=[member.value for member in FootprintProvider],
         target_precisions=[80, 85, 90],
+        source_capabilities=capabilities,
     )
 
 

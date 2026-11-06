@@ -46,7 +46,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.5.0"
+ENGINE_VERSION = "1.6.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -941,6 +941,7 @@ def build_footprint_summary(
         "source": footprint_source,
         "source_files": [str(path) for path in footprint_paths],
         "attribution": provider.attribution,
+        "capabilities": provider.capabilities.to_dict(),
         "confidence_threshold": min_confidence,
         **threshold_provenance_report(provider_records, target_precision, thresholds_path, thresholds_source),
         "source_records_loaded": len(provider_records),

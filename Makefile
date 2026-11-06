@@ -14,8 +14,8 @@ lint:
 	@set -eu; tmp="$$(mktemp -d "$(TMP_ROOT)/cad-fond-lint.XXXXXX")"; trap 'rm -rf "$$tmp"' EXIT; \
 	$(PYTHON) -m venv "$$tmp/venv"; \
 	PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$$tmp/venv/bin/python" -m pip install --no-cache-dir ruff==0.17.3 mypy==2.4.1; \
-	"$$tmp/venv/bin/ruff" check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/check.py tests; \
-	"$$tmp/venv/bin/ruff" format --check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/check.py tests; \
+	"$$tmp/venv/bin/ruff" check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/check.py tests; \
+	"$$tmp/venv/bin/ruff" format --check server tools/cad-fond-de-plan-build.py tools/footprint_providers.py tools/layout_engine.py tools/urban_topology.py tools/deliverable_qa.py tools/report_schema.py tools/acquisition.py tools/check.py tests; \
 	"$$tmp/venv/bin/mypy" server/mcp_server.py
 
 build:
