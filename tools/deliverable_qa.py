@@ -14,9 +14,23 @@ wheel, or via ``importlib`` from ``server/mcp_server.py``.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+# v1.11.0: plotting standards live in tools/dxf_standards.py. This module is documented
+# as loadable "by path from a checkout, by package import from an installed wheel, or
+# via importlib from server/mcp_server.py", so the sibling directory is put on sys.path
+# explicitly rather than assuming the caller arranged it. This keeps that documented
+# contract intact; a plain `from dxf_standards import ...` breaks the by-path case.
+_TOOLS_DIR = Path(__file__).resolve().parent
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+
+from dxf_standards import LAYERS as REQUIRED_LAYERS  # noqa: E402
+from dxf_standards import dxf_is_vector_only as dxf_raster_findings  # noqa: E402
+from dxf_standards import hatch_findings as dxf_hatch_findings  # noqa: E402
 
 QA_CONTRACT_VERSION = "1.0"
 
@@ -30,24 +44,9 @@ REPORT = "fond-de-plan-report.json"
 DRAWING_DELIVERABLES = (HOLLOW_SVG, HATCHED_SVG, DXF, PNG, PDF)
 ALL_DELIVERABLES = (*DRAWING_DELIVERABLES, REPORT)
 
-# Architectural layer schema: name -> required DXF attributes.
-REQUIRED_LAYERS: dict[str, dict[str, Any]] = {
-    "BUILDINGS": {"lineweight": 50, "color": 7},
-    "HATCH": {"lineweight": 13, "color": 7},
-    "ROADS": {"lineweight": 35, "color": 7},
-    "PARCELS": {"lineweight": 18, "color": 7},
-    "SITE_BOUNDARY": {"lineweight": 60, "color": 7, "linetype": "SITE_DASH"},
-    "G-BLDG-WALL": {"lineweight": 50, "color": 7},
-    "G-BLDG-SHARED": {"lineweight": 50, "color": 7},
-    "G-ROAD-CURB": {"lineweight": 35, "color": 7},
-    "G-ROAD-CL": {"lineweight": 18, "color": 7, "linetype": "CENTER"},
-    "G-PARCEL": {"lineweight": 18, "color": 7},
-    "G-HATCH": {"lineweight": 13, "color": 7},
-    "G-SITE-BOUNDARY": {"lineweight": 60, "color": 7, "linetype": "SITE_DASH"},
-    "G-ANNO-GRID": {"lineweight": 13, "color": 7},
-    "G-ANNO-NORTH": {"lineweight": 25, "color": 7},
-    "G-ANNO-TTLB": {"lineweight": 35, "color": 7},
-}
+# Architectural layer schema: v1.11.0 sources this from tools/dxf_standards.py so the
+# builder and this gate read one table. Duplicating it here is how the two silently
+# disagree about what a layer is supposed to look like.
 
 REQUIRED_LAYER_NAMES = frozenset(REQUIRED_LAYERS)
 ANNOTATION_BLOCKS = ("GRID_CROSS", "NORTH_ARROW")
@@ -231,6 +230,9 @@ def qa_dxf_file(path: Path, expected_layouts: frozenset[str] | None = None) -> d
         metric_units = doc.header.get("$INSUNITS") == 6
         layer_names = {layer.dxf.name for layer in doc.layers}
         findings.extend(_layer_findings(doc, layer_names))
+        # v1.11.0: plotting standards — hatch boundary/island codes and vector-first.
+        findings.extend(dxf_hatch_findings(doc))
+        findings.extend(dxf_raster_findings(doc))
         modelspace_issues, has_centerlines = _modelspace_findings(doc)
         findings.extend(modelspace_issues)
         if has_centerlines:

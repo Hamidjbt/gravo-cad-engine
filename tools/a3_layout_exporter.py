@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Portable, underscore-named CLI alias for the read-only A3 zoom exporter."""
+
 from __future__ import annotations
 import importlib.util
 from pathlib import Path

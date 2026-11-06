@@ -6,6 +6,7 @@ only the SVG viewBox/layout is changed. Hatch strokes are re-generated from the 
 building polygons at the original paper-space pitch so the 0.13 mm pen and 3.5 px/96dpi
 spacing remain correct after zooming.
 """
+
 from __future__ import annotations
 import argparse
 import copy
@@ -65,7 +66,7 @@ def parse_path_rings(d: str) -> list[list[tuple[float, float]]]:
                 continue
             continue
         if command not in ("M", "L") or i + 1 >= len(tokens):
-            raise ValueError(f"Unsupported SVG path command near {tokens[i:i+4]}")
+            raise ValueError(f"Unsupported SVG path command near {tokens[i : i + 4]}")
         x, y = float(tokens[i]), float(tokens[i + 1])
         current.append((x, y))
         i += 2
@@ -186,10 +187,15 @@ def build(source: Path, output_dir: Path) -> dict:
     # hatch stays 3.5 px at 96 dpi after the 1:250 zoom. All lines are shapely-clipped.
     hatch_group = copy.deepcopy(find_group(source_root, "HATCH"))
     hatch_group.clear()
-    hatch_group.attrib.update({
-        "id": "HATCH", "fill": "none", "stroke": "#000000",
-        "stroke-linecap": "butt", "stroke-width": f"{0.13 / zoom:.8f}"
-    })
+    hatch_group.attrib.update(
+        {
+            "id": "HATCH",
+            "fill": "none",
+            "stroke": "#000000",
+            "stroke-linecap": "butt",
+            "stroke-width": f"{0.13 / zoom:.8f}",
+        }
+    )
     hatch_count = 0
     for poly in buildings:
         for line in hatch_lines(poly, hatch_pitch_source):
@@ -198,21 +204,27 @@ def build(source: Path, output_dir: Path) -> dict:
                 ET.SubElement(hatch_group, f"{{{SVG_NS}}}path", {"d": d})
                 hatch_count += 1
 
-    new_root = ET.Element(f"{{{SVG_NS}}}svg", {
-        "width": "420mm", "height": "297mm",
-        "viewBox": f"0 0 {crop_w:.6f} {crop_h:.6f}",
-        "preserveAspectRatio": "xMidYMid meet",
-        "version": "1.1", "baseProfile": "full"
-    })
-    ET.SubElement(new_root, f"{{{SVG_NS}}}rect", {
-        "x": "0", "y": "0", "width": f"{crop_w:.6f}",
-        "height": f"{crop_h:.6f}", "fill": "#FFFFFF"
-    })
+    new_root = ET.Element(
+        f"{{{SVG_NS}}}svg",
+        {
+            "width": "420mm",
+            "height": "297mm",
+            "viewBox": f"0 0 {crop_w:.6f} {crop_h:.6f}",
+            "preserveAspectRatio": "xMidYMid meet",
+            "version": "1.1",
+            "baseProfile": "full",
+        },
+    )
+    ET.SubElement(
+        new_root,
+        f"{{{SVG_NS}}}rect",
+        {"x": "0", "y": "0", "width": f"{crop_w:.6f}", "height": f"{crop_h:.6f}", "fill": "#FFFFFF"},
+    )
     # Normalize the SVG viewport to a zero origin; this avoids print-preview engines
     # treating the prior nonzero base-map coordinates as a tiny positioned drawing.
-    content = ET.SubElement(new_root, f"{{{SVG_NS}}}g", {
-        "id": "CROPPED_SITE_PLAN", "transform": f"translate({-x0:.6f} {-y0:.6f})"
-    })
+    content = ET.SubElement(
+        new_root, f"{{{SVG_NS}}}g", {"id": "CROPPED_SITE_PLAN", "transform": f"translate({-x0:.6f} {-y0:.6f})"}
+    )
     for gid in ["ROADS", "PARCELS", "BUILDINGS"]:
         content.append(copied[gid])
     content.append(hatch_group)
@@ -252,15 +264,23 @@ def build(source: Path, output_dir: Path) -> dict:
         "site_bbox_center_source_units": [cx, cy],
         "site_bbox_center_on_page_mm": [210.0, 148.5],
         "crop_viewbox_source_units": [x0, y0, crop_w, crop_h],
-        "paper": {"size_mm": [420, 297], "orientation": "landscape", "scale": "1:250", "png_px": [png_w, png_h], "dpi": 300},
+        "paper": {
+            "size_mm": [420, 297],
+            "orientation": "landscape",
+            "scale": "1:250",
+            "png_px": [png_w, png_h],
+            "dpi": 300,
+        },
         "pen_weights_mm": {"BUILDINGS": 0.50, "ROADS": 0.35, "PARCELS": 0.18, "HATCH": 0.13, "SITE_BOUNDARY": 0.60},
         "hatch_pitch_mm": PAPER_HATCH_MM,
-        "outputs": [str(svg_path), str(pdf_path), str(png_path)]
+        "outputs": [str(svg_path), str(pdf_path), str(png_path)],
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only crop of the existing Fond de Plan to centered A3 landscape at 1:250")
+    parser = argparse.ArgumentParser(
+        description="Read-only crop of the existing Fond de Plan to centered A3 landscape at 1:250"
+    )
     default_site_plan = Path.home() / "site-plan"
     parser.add_argument("--source", default=str(default_site_plan / "fond-de-plan-hatched.svg"))
     parser.add_argument("--output-dir", default=str(default_site_plan))

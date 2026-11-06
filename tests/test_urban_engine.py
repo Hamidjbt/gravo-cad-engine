@@ -161,7 +161,18 @@ def test_r2018_dxf_has_architectural_layers_blocks_and_three_paper_layouts(tmp_p
         "G-ANNO-TTLB",
     }
     assert required <= names
-    assert all(doc.layers.get(name).dxf.color == 7 for name in required)
+    # v1.11.0: layers are deliberately polychrome for CTB plotting. The previous
+    # contract asserted every layer was ACI 7, which encoded a defect (layer colours
+    # and lineweights were being dropped entirely) rather than a design intent.
+    # Structural ink stays adaptive ACI 7; context takes real pen indices.
+    import dxf_standards as std
+
+    assert doc.layers.get("G-BLDG-WALL").dxf.color == std.ACI_ADAPTIVE
+    assert doc.layers.get("G-ROAD-CURB").dxf.color == std.ACI_CONTEXT
+    assert doc.layers.get("G-BLDG-FILL").dxf.color != std.ACI_ADAPTIVE
+    # Lineweights must survive the write; BYLAYER (-3) everywhere means they were lost.
+    assert all(doc.layers.get(name).dxf.lineweight != -3 for name in required)
+    assert doc.layers.get("G-SITE-BOUNDARY").dxf.lineweight > doc.layers.get("G-BLDG-WALL").dxf.lineweight
     assert doc.layers.get("G-ROAD-CL").dxf.linetype == "CENTER"
     assert doc.layers.get("G-SITE-BOUNDARY").dxf.linetype == "SITE_DASH"
     assert doc.dxfversion == "AC1032"

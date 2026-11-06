@@ -24,6 +24,13 @@ import pandas as pd
 import requests
 import svgwrite
 from deliverable_qa import DRAWING_DELIVERABLES, qa_output_directory
+from dxf_standards import (
+    HATCH_LAYER,
+    HATCH_SOLID,
+    create_layer,
+    layer_attributes,
+    pattern_scale_for,
+)
 from egress_manager import ArtifactEgress, EgressError, egress_report_block, resolve_sink
 from footprint_providers import (
     OSM_ATTRIBUTION,
@@ -56,7 +63,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.10.0"
+ENGINE_VERSION = "1.11.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -806,6 +813,32 @@ def write_svg(
     dwg.save(pretty=True)
 
 
+#: DXF writers stamp the current time and a fresh GUID into every file, so two runs of
+#: the same inputs produce different bytes. That breaks reproducibility and makes the
+#: artifact's size — which a resumable upload session must declare up front — vary
+#: between runs. Canonicalising these four header timestamps, the ezdxf version stamp
+#: and every GUID makes the output byte-identical for identical inputs.
+_DXF_TIMESTAMP = re.compile(r"(\$TD(?:UPDATE|CREATE|UUPDATE|UCREATE)\n\s*\d+\n)[0-9.\-]+")
+_DXF_EZDXF_STAMP = re.compile(r"(\d+\.\d+\.\d+ @ )[0-9T:.+\-]+")
+_DXF_GUID = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+
+
+def canonicalize_dxf_text(text: str) -> str:
+    """Replace volatile metadata so identical inputs yield identical bytes."""
+    text = _DXF_TIMESTAMP.sub(r"\g<1>2451545.0", text)
+    text = _DXF_EZDXF_STAMP.sub(r"\g<1>deterministic", text)
+    return _DXF_GUID.sub("{00000000-0000-0000-0000-000000000000}", text)
+
+
+def save_dxf_deterministic(doc, path: Path) -> None:
+    """Write ``doc`` to ``path`` with volatile metadata canonicalised."""
+    import io as _io
+
+    buffer = _io.StringIO()
+    doc.write(buffer)
+    path.write_text(canonicalize_dxf_text(buffer.getvalue()), encoding=doc.output_encoding)
+
+
 def add_dxf_polyline(msp, ring, close: bool, layer: str):
     pts = list(ring.coords)
     if len(pts) > 1 and math.dist(pts[0][:2], pts[-1][:2]) < 1e-6:
@@ -829,8 +862,18 @@ def write_dxf(
     layout_bounds_m=None,
     layout_spec: tuple[str, int] | None = None,
     orientation: str = "landscape",
+    hatch_pattern: str = HATCH_SOLID,
+    road_casement=None,
+    min_road_area_m2: float = 1.0,
 ):
-    """Write a metric R2018 model plus optional exact-scale multi-sheet paper layouts."""
+    """Write a metric R2018 model plus optional exact-scale multi-sheet paper layouts.
+
+    v1.11.0 adds plotting styling: ACI-coloured layers with hierarchical lineweights,
+    building poché bounded by its courtyards, and closed road polygons where the
+    casement geometry allows it. ``hatch_pattern`` is ``SOLID`` (default architectural
+    fill) or ``ANSI31``; the pattern scale is derived from the declared denominator so
+    the hatch lands at a fixed pitch on paper regardless of plot scale.
+    """
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 6  # meters
     doc.header["$MEASUREMENT"] = 1
@@ -839,34 +882,20 @@ def write_dxf(
     doc.header["$USERI1"] = int(epsg)
     doc.header["$UCSORG"] = (center[0], center[1], 0)
 
-    # Keep legacy layer names for downstream consumers; new G-* layers are the
-    # controlled architectural schema consumed by the precision export.
-    layers = {
-        "BUILDINGS": {"color": 7, "lineweight": 50},
-        "HATCH": {"color": 7, "lineweight": 13},
-        "ROADS": {"color": 7, "lineweight": 35},
-        "PARCELS": {"color": 7, "lineweight": 18},
-        "SITE_BOUNDARY": {"color": 7, "lineweight": 60, "linetype": "SITE_DASH"},
-        "G-BLDG-WALL": {"color": 7, "lineweight": 50},
-        "G-BLDG-SHARED": {"color": 7, "lineweight": 50},
-        "G-ROAD-CURB": {"color": 7, "lineweight": 35},
-        "G-ROAD-CL": {"color": 7, "lineweight": 18, "linetype": "CENTER"},
-        "G-PARCEL": {"color": 7, "lineweight": 18},
-        "G-HATCH": {"color": 7, "lineweight": 13},
-        "G-SITE-BOUNDARY": {"color": 7, "lineweight": 60, "linetype": "SITE_DASH"},
-        "G-ANNO-GRID": {"color": 7, "lineweight": 13},
-        "G-ANNO-NORTH": {"color": 7, "lineweight": 25},
-        "G-ANNO-TTLB": {"color": 7, "lineweight": 35},
-    }
+    # v1.11.0: layers, ACI colours and lineweights come from tools/dxf_standards.py so
+    # the builder and the QA gate cannot disagree about what a layer should look like.
+    layers = layer_attributes()
+    # Show lineweights in the editor; without this a correct file looks unstyled.
+    doc.header["$LWDISPLAY"] = 1
     if "SITE_DASH" not in doc.linetypes:
         doc.linetypes.add(
             "SITE_DASH", pattern=[4.0 / scale_mm_m, -2.0 / scale_mm_m], description="4mm dash / 2mm gap at sheet scale"
         )
     if "CENTER" not in doc.linetypes:
         doc.linetypes.add("CENTER", pattern=[1.25, -0.25, 0.25, -0.25], description="Road centerline")
-    for name, attrs in layers.items():
+    for name in layers:
         if name not in doc.layers:
-            doc.layers.new(name, dxfattribs=attrs)
+            create_layer(doc, name)
     doc.header["$CLAYER"] = "G-BLDG-WALL"
     msp = doc.modelspace()
     for line in flatten_lines(road_boundaries):
@@ -894,6 +923,46 @@ def write_dxf(
             for line in flatten_lines(candidate):
                 add_dxf_polyline(msp, line, False, "G-ROAD-CL")
 
+    # v1.11.0 — road surfaces as clean, closed polygons for urban background context.
+    # The casement is already a polygonized corridor, so its polygons are the surfaces;
+    # only when that polygonization produced nothing do we fall back to open boundary
+    # lines, and the caller records that fallback in the report rather than pretending
+    # the result is closed.
+    road_polygons = 0
+    if road_casement is not None and not getattr(road_casement, "is_empty", True):
+        for polygon in flatten_polygons(make_valid(road_casement)):
+            if polygon.is_empty or polygon.area < min_road_area_m2:
+                continue
+            add_dxf_polyline(msp, polygon.exterior, True, "G-ROAD-SURFACE")
+            for ring in polygon.interiors:
+                add_dxf_polyline(msp, ring, True, "G-ROAD-SURFACE")
+            road_polygons += 1
+
+    # v1.11.0 — architectural poché. One HATCH per building, with each courtyard as an
+    # inner island path so it reads as void. flags=1 marks the outer path external;
+    # inner rings must be flags=0 or the courtyard fills in. hatch_style is set
+    # explicitly (0 = nested, odd-parity) instead of relying on the library default.
+    hatch_scale = pattern_scale_for(layout_spec[1]) if layout_spec else None
+    hatched = 0
+    for poly in buildings:
+        rings = [poly.exterior, *poly.interiors]
+        usable = []
+        for ring in rings:
+            coords = [(float(x), float(y)) for x, y, *_ in ring.coords]
+            if len(coords) >= 4:
+                usable.append(coords)
+        if not usable:
+            continue
+        hatch = msp.add_hatch(dxfattribs={"layer": HATCH_LAYER})
+        if hatch_pattern == HATCH_SOLID:
+            hatch.set_solid_fill(color=8)
+        else:
+            hatch.set_pattern_fill(hatch_pattern, scale=hatch_scale or 1.0)
+        hatch.dxf.hatch_style = 0  # nested / odd-parity: islands stay empty
+        for index, coords in enumerate(usable):
+            hatch.paths.add_polyline_path(coords, is_closed=True, flags=1 if index == 0 else 0)
+        hatched += 1
+
     if layout_bounds_m is not None:
         layouts = (
             [resolve_layout(tuple(layout_bounds_m), layout_spec[0], layout_spec[1], orientation=orientation)]
@@ -907,7 +976,7 @@ def write_dxf(
         # Fixed-size UTM grid crosses and labels are composed in each paper layout.
         for sheet_layout in layouts:
             add_paperspace_viewport(doc, sheet_layout, metadata)
-    doc.saveas(path)
+    save_dxf_deterministic(doc, path)
 
 
 def resolve_sheet_placement(args, radius: float, center_utm: tuple[float, float]):
@@ -1352,6 +1421,8 @@ def _build_core(args, out_dir: Path) -> dict:
     # because that is the only pair that states a real plot scale.
     sheet_placement = resolve_sheet_placement(args, radius, (cx, cy))
     scale_mm_m = sheet_placement.mm_per_m
+    # v1.11.0 plotting style. Default SOLID architectural poché; ANSI31 is opt-in.
+    hatch_pattern = getattr(args, "hatch_pattern", HATCH_SOLID).upper()
     # Requested 3.5 px hatch pitch at 96 DPI, converted to world metres at declared plot scale.
     hatch_pitch_mm = 3.5 / (96.0 / 25.4)
     hatch_spacing_m = hatch_pitch_mm / scale_mm_m
@@ -1388,7 +1459,28 @@ def _build_core(args, out_dir: Path) -> dict:
         layout_bounds_m=layout_bounds_m,
         layout_spec=layout_spec,
         orientation=sheet_placement.orientation,
+        hatch_pattern=hatch_pattern,
+        road_casement=road_casement,
     )
+    # v1.11.0: state honestly whether road casements are closed polygons. Sparse OSM
+    # data can leave the corridor empty, in which case the DXF carries open boundary
+    # lines and the report says so instead of implying a fill that will not plot.
+    dxf_doc = ezdxf.readfile(out_dir / "fond-de-plan-cad.dxf")
+    road_surface_count = sum(
+        1 for e in dxf_doc.modelspace().query("LWPOLYLINE") if e.dxf.layer == "G-ROAD-SURFACE" and e.closed
+    )
+    hatch_count = len(list(dxf_doc.modelspace().query("HATCH")))
+    road_geometry_state = {
+        "mode": "closed-polygons" if road_surface_count else "open-boundaries-fallback",
+        "closed_polygons": road_surface_count,
+        "fallback": road_surface_count == 0,
+        "reason": (
+            None
+            if road_surface_count
+            else "road casement polygonization produced no surface above the area threshold; "
+            "open curb boundaries were emitted instead"
+        ),
+    }
     png_path, pdf_path = out_dir / "fond-de-plan-sheet-300dpi.png", out_dir / "fond-de-plan-sheet-300dpi.pdf"
     render_sheet(hollow, hatched, png_path, pdf_path, sheet_placement)
     expected_px = expected_png_px(sheet_placement)
@@ -1570,6 +1662,16 @@ def _build_core(args, out_dir: Path) -> dict:
         "attribution": attribution,
         "warnings": [*build_warnings(image_path, gsd, provider, osm_method, threshold_warnings)],
     }
+    report["dxf_styling"] = {
+        "hatch_pattern": hatch_pattern,
+        "hatch_scale": None
+        if hatch_pattern == HATCH_SOLID
+        else round(pattern_scale_for(layout_spec[1]) if layout_spec else 1.0, 3),
+        "hatch_entities": hatch_count,
+        "hatch_style": "nested (islands empty)",
+        "paper_hatch_pitch_mm": 2.0 if hatch_pattern != HATCH_SOLID else None,
+        "road_geometry": road_geometry_state,
+    }
     report = apply_detail(report, getattr(args, "report_detail", DEFAULT_REPORT_DETAIL))
     (out_dir / "fond-de-plan-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
@@ -1738,6 +1840,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("summary", "full"),
         default=DEFAULT_REPORT_DETAIL,
         help="summary omits per-feature provenance arrays to keep archival reports compact",
+    )
+    p.add_argument(
+        "--hatch-pattern",
+        choices=("solid", "ansi31"),
+        default="solid",
+        help="building poché fill: solid (default) or ansi31 survey hatching",
     )
     p.add_argument("--json", action="store_true", help="emit JSON report to stdout")
     return p

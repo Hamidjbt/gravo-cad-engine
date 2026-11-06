@@ -258,6 +258,58 @@ Six artifacts totalling **15,444,614 bytes** streamed to `Gravo_CAD_Deliverables
 raster alone took 49 chunks — with `workspace delta: 0 bytes` and the buffer purged on exit.
 
 
+### Phase 13 — DXF plotting standards (1.11.0)
+
+Geometrically correct DXF is not the same as a plottable one. This phase adds the
+styling layer a large-format plotter needs, and in doing so uncovered three defects
+that only a plot would have revealed.
+
+**Layers, colours, lineweights.** `tools/dxf_standards.py` is now the single table of
+layer names, ACI colours and lineweights, imported by both the builder and the QA gate,
+so the two cannot disagree. Structural ink stays on adaptive ACI 7 (black on white,
+white on black); context takes real indices (8 grey, 9 light, 1 primary) so a CTB pen
+table can key off them.
+
+**The defect that started it.** `LayerTable.add(dxfattribs={"color": …, "lineweight": …})`
+silently discards *both* values in ezdxf 1.4.5, leaving every layer at ACI 7 with
+lineweight BYLAYER. Every DXF shipped from v1.9.0 through v1.10.0 was therefore uniformly
+unstyled — the intent was in the source and in the file's memory, never on disk. Layers
+are now created with explicit assignment (`create_layer`), and a regression test pins the
+library behaviour so the trap is visible if it ever changes.
+
+**Architectural hatching.** One HATCH per building, `SOLID` poché by default with
+`--hatch-pattern ansi31` opt-in. Courtyards are inner boundary paths with `flags=0`;
+outer rings use `flags=1`. `hatch_style` is written explicitly as 0 (nested/odd-parity)
+instead of relying on the library default, because that group code — not the path flags
+— is what determines island behaviour in a plotting application.
+
+**The second defect.** The pattern scale was derived from ANSI31's *offset magnitude*
+(3.175) instead of its *perpendicular line spacing* (3.175 × cos45° = 2.2451), making
+every pattern 41 % too coarse; and an earlier draft used millimetres for a
+drawing-unit quantity, a 25.4× error. Both are invisible in the DXF and obvious on paper.
+`pattern_scale_for(denominator)` now derives the scale so a 2 mm pitch lands on paper at
+any plot scale: 0.223 at 1:250, 0.445 at 1:500, 0.891 at 1:1000.
+
+**Clean road polygons.** The road casement is already a polygonized corridor, so its
+polygons are emitted as closed `G-ROAD-SURFACE` polylines. When polygonization yields
+nothing, the run falls back to open curb boundaries and the report states
+`road_geometry.mode = "open-boundaries-fallback"` with a reason — it never claims a
+closure it does not have.
+
+**The third defect: non-deterministic bytes.** DXF writers stamp wall-clock time
+(`$TDCREATE`, `$TDUPDATE`, …) and fresh GUIDs into every file, so identical inputs
+produced different bytes and different sizes. That is merely untidy for reproducibility
+but fatal for a size-declared resumable upload. `save_dxf_deterministic` canonicalises
+four header timestamps, the ezdxf version stamp and all GUIDs; two runs now produce
+byte-identical files.
+
+**Renderer limitation, recorded so nobody rediscovers it.** ezdxf's own drawing add-on
+renders SOLID hatches correctly but draws *nothing* for pattern hatches — ANSI31
+produced zero non-white pixels across four scale and size combinations while the DXF
+tags were valid (`2:ANSI31`, `70:0`, `75:1`, `41:0.891`). Verification therefore runs on
+three axes: DXF group codes, independent point-in-polygon geometry, and a budget ceiling.
+Visual ANSI31 sign-off requires real CAD or a plotter.
+
 ---
 
 ## 3. System architecture and modules
@@ -407,10 +459,10 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.10.0**.
+- Skill/manifest version: **1.11.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
-- Latest full regression run: **306 passed**; `make lint` clean on 26 files; mypy clean.
+- Latest full regression run: **334 passed**; `make lint` clean on 29 files; mypy clean.
 - Validated A3 artifacts are protected and remain in `/home/user/site-plan/`.
 - Full generation/render/export was intentionally not run during this engineering upgrade.
 - Quota recovery left `/home/user` at **378 files / 43M** (target: <500 files / <100MB); filesystem use is 17%. The validated A3 SVG/PDF and all critical skill source remain. At the pre-cleanup inventory, only the A3 SVG and PDF were present; no A3 300-dpi PNG existed in `site-plan`, and none was removed.
