@@ -1,6 +1,6 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.6.0  
+**Current release:** 1.7.0  
 **Last updated:** 2026-11-05  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
@@ -107,6 +107,28 @@ Release **1.6.0** introduces `tools/acquisition.py`:
 `MicrosoftFootprintProvider` and `GoogleOpenBuildingsProvider` were rewritten onto this layer; both lost their private download code and their `requests`/`tempfile` imports. `provider_capabilities()` publishes the matrix, which now appears in the report (`footprints.capabilities`) and in MCP `list_supported_formats.source_capabilities`.
 
 A test-only `StubSource` proves the extension point: a third provider needs no edits to the layer.
+
+### Phase 8 — Scale-safe deduplication (1.7.0)
+
+`merge_footprint_records` bounded duplicate detection with `unique[:120]`. Beyond 120 retained
+footprints a duplicate was kept silently, which dense fabric and large A0 sheets can reach.
+
+Release **1.7.0** replaces the fixed window with an incremental spatial hash:
+
+- **Bucketing** — cells sized from the first footprint's extent; a candidate materialises only the
+  buckets overlapping its padded envelope, so comparisons scale with local density.
+- **Overflow list** — records larger than the grid (a warehouse among houses) are always scanned,
+  so oversized footprints can never be missed.
+- **Constant-time insertion** — an `STRtree` rebuild per insert had made the merge quadratic
+  (~1.9 s for 4,096 records); the hash brought that to ~48 ms.
+- **Explicit bounds** — `dedup_window=N` still bounds the scan for callers that want it, and the
+  bound is reported rather than silent. `0` or negative means unbounded.
+- **Diagnostics** — `DeduplicationReport` records drop reasons, comparisons, index skips, and any
+  applied bound; it surfaces as `footprints.deduplication` in the build report.
+
+The merge is not merely faster or wider: parity tests assert identical output to the exhaustive
+reference algorithm across grid, randomised, mixed-size, and oversized-footprint inputs. A
+performance guard fails the suite if comparison counts regress toward exhaustive scanning.
 
 ---
 
@@ -257,7 +279,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.6.0**.
+- Skill/manifest version: **1.7.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.

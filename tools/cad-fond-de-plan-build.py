@@ -27,6 +27,7 @@ from deliverable_qa import DRAWING_DELIVERABLES, qa_output_directory
 from footprint_providers import (
     OSM_ATTRIBUTION,
     BaseFootprintProvider,
+    DeduplicationReport,
     FootprintRecord,
     MicrosoftFootprintProvider,
     get_footprint_provider,
@@ -46,7 +47,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.6.0"
+ENGINE_VERSION = "1.7.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -926,6 +927,7 @@ def build_footprint_summary(
     target_precision: int | None = None,
     thresholds_path: Path | None = None,
     thresholds_source: str = "not-requested",
+    dedup_report: DeduplicationReport | None = None,
 ) -> dict:
     """Assemble report-ready footprint provenance, including threshold policy.
 
@@ -950,6 +952,7 @@ def build_footprint_summary(
         "source_confidence_max": max(confidence_scores) if confidence_scores else None,
         "unique_input_footprints_after_osm_merge": len(unique_records),
         "unique_input_counts_by_provider": source_counts,
+        "deduplication": dedup_report.to_dict() if dedup_report is not None else None,
         "final_output_footprints": len(building_provenance),
         "output_provenance": building_provenance,
     }
@@ -1083,7 +1086,8 @@ def build(args) -> dict:
             )
     # OSM retains priority over near-identical inferred outlines; all records retain
     # their original source IDs/confidence through deduplication and topology.
-    unique_records = merge_footprint_records(osm_records, provider_records)
+    dedup_report = DeduplicationReport()
+    unique_records = merge_footprint_records(osm_records, provider_records, report=dedup_report)
     block_topology, ortho_sources, conservative_fallbacks, vacant_site_false_positives = regularize_footprint_records(
         unique_records, site, study_circle
     )
@@ -1167,6 +1171,7 @@ def build(args) -> dict:
         target_precision,
         thresholds_path,
         thresholds_source,
+        dedup_report,
     )
     legacy_provider_report = {}
     if provider_name == "microsoft":

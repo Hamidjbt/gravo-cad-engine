@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.6.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.7.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,31 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## Scale-safe deduplication (v1.7.0)
+
+`merge_footprint_records` previously compared each candidate only against the first 120 retained
+records (`unique[:120]`). A duplicate of the 121st-or-later footprint was therefore kept silently —
+reachable in dense fabric and on large A0 sheets, where 300 m of urban frontage can yield several
+hundred footprints.
+
+Duplicate lookup is now an incremental spatial hash whose cost tracks local density rather than the
+number of retained records:
+
+- records are bucketed into cells sized from the first footprint's extent;
+- a candidate only materialises buckets overlapping its padded envelope;
+- footprints larger than the grid (a warehouse among houses) go to an always-scanned overflow list
+  so they can never be missed;
+- results are identical to the exhaustive algorithm — verified by parity tests against a reference
+  implementation across randomised inputs.
+
+Measured on a synthetic grid: 4,096 footprints went from ~1.9 s (quadratic) to ~48 ms (near-linear).
+
+`--dedup-window` is deliberately **not** exposed on the CLI: correctness is the default. Callers that
+genuinely need a bounded scan can pass `dedup_window=N`, and the bound is then recorded in the report
+rather than applied silently. `DeduplicationReport` counters (`candidates_compared`,
+`candidates_skipped_by_index`, drop reasons, `bounded_window`) appear in
+`fond-de-plan-report.json` → `footprints.deduplication`.
 
 ## Acquisition layer (v1.6.0)
 

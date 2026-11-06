@@ -14,7 +14,7 @@ import json
 import math
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +156,149 @@ def _project_records(
     ]
 
 
+@dataclass
+class DeduplicationReport:
+    """Counters describing how a merge was resolved.
+
+    ``candidates_compared`` and ``candidates_skipped_by_index`` exist so callers
+    can prove the spatial index is doing work rather than silently falling back
+    to an exhaustive scan.
+    """
+
+    authoritative_in: int = 0
+    inferred_in: int = 0
+    authoritative_kept: int = 0
+    dropped_below_minimum_area: int = 0
+    dropped_as_authoritative_duplicate: int = 0
+    dropped_as_duplicate: int = 0
+    output_count: int = 0
+    candidates_compared: int = 0
+    candidates_skipped_by_index: int = 0
+    index_filtered: bool = False
+    bounded_window: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class _OverlapIndex:
+    """Incrementally-built spatial hash for duplicate lookup.
+
+    A tree index would have to be rebuilt on every insertion, which made the
+    merge quadratic. This hash inserts in constant time and only materialises the
+    records whose cells overlap the candidate's padded window, so cost tracks
+    local density instead of the number of retained records.
+
+    Oversized footprints (larger than the bucket grid, e.g. a warehouse among
+    houses) are kept in a separate always-scanned list so they are never missed.
+    """
+
+    MAX_CELLS_PER_RECORD = 64
+
+    def __init__(self, envelope_padding_ratio: float, cell_size: float | None = None) -> None:
+        self._padding_ratio = max(0.0, float(envelope_padding_ratio))
+        self._cell_size = cell_size
+        self._cells: dict[tuple[int, int], list[int]] = {}
+        self._oversized: list[int] = []
+        self._geometries: list[Polygon] = []
+        self._records: list[FootprintRecord] = []
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    # -- geometry helpers ---------------------------------------------------
+
+    @staticmethod
+    def _bounds(geometry: Polygon) -> tuple[float, float, float, float]:
+        return geometry.bounds
+
+    def _padded(self, geometry: Polygon) -> tuple[float, float, float, float]:
+        minx, miny, maxx, maxy = self._bounds(geometry)
+        span = max(maxx - minx, maxy - miny)
+        pad = span * self._padding_ratio
+        return minx - pad, miny - pad, maxx + pad, maxy + pad
+
+    def _cells_for(self, bounds: tuple[float, float, float, float]) -> list[tuple[int, int]]:
+        if self._cell_size is None or self._cell_size <= 0:
+            return [(0, 0)]
+        size = self._cell_size
+        minx, miny, maxx, maxy = bounds
+        x0, y0 = math.floor(minx / size), math.floor(miny / size)
+        x1, y1 = math.floor(maxx / size), math.floor(maxy / size)
+        if (x1 - x0 + 1) * (y1 - y0 + 1) > self.MAX_CELLS_PER_RECORD:
+            return []
+        return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+
+    def _ensure_cell_size(self, geometry: Polygon) -> None:
+        if self._cell_size is None:
+            minx, miny, maxx, maxy = self._bounds(geometry)
+            span = max(maxx - minx, maxy - miny, 1e-6)
+            self._cell_size = span * 2.0
+
+    # -- operations ---------------------------------------------------------
+
+    def nearest_duplicate(
+        self, candidate: FootprintRecord, overlap_threshold: float, max_rank: int | None = None
+    ) -> tuple[FootprintRecord | None, int, int]:
+        """Return ``(duplicate_or_none, comparisons, skipped_by_index)``.
+
+        ``max_rank`` (exclusive) restricts eligibility to the first N retained
+        records, which reproduces the historical ``unique[:N]`` window exactly.
+        It exists only so callers can opt into a bounded scan explicitly.
+        """
+        if not self._records:
+            return None, 0, 0
+        keys = self._cells_for(self._padded(candidate.geometry))
+        if not keys:
+            candidates = list(range(len(self._records)))
+            skipped = 0
+        else:
+            positions: set[int] = set(self._oversized)
+            for key in keys:
+                bucket = self._cells.get(key)
+                if bucket:
+                    positions.update(bucket)
+            candidates = sorted(positions)
+            skipped = len(self._records) - len(candidates)
+        comparisons = 0
+        for position in candidates:
+            if max_rank is not None and position >= max_rank:
+                skipped += 1
+                continue
+            comparisons += 1
+            previous = self._records[position]
+            if _overlap_ratio(candidate.geometry, previous.geometry) > overlap_threshold:
+                return previous, comparisons, skipped
+        return None, comparisons, skipped
+
+    def add(self, record: FootprintRecord) -> None:
+        self._ensure_cell_size(record.geometry)
+        position = len(self._records)
+        self._records.append(record)
+        self._geometries.append(record.geometry)
+        keys = self._cells_for(self._padded(record.geometry))
+        if not keys:
+            self._oversized.append(position)
+            return
+        for key in keys:
+            self._cells.setdefault(key, []).append(position)
+
+
+def _overlap_ratio(candidate: Polygon, known: Polygon) -> float:
+    """Overlap as a fraction of the smaller footprint; 0.0 when either is degenerate."""
+    denominator = max(min(candidate.area, known.area), 1e-8)
+    return candidate.intersection(known).area / denominator
+
+
+def _any_overlapping(records: list[FootprintRecord], candidate: FootprintRecord, threshold: float) -> bool:
+    """Exact check against a small set (authoritative OSM records).
+
+    OSM extracts are bounded by the study radius, so an exhaustive scan here is
+    cheap and avoids any indexing approximation.
+    """
+    return any(_overlap_ratio(candidate.geometry, known.geometry) > threshold for known in records)
+
+
 def merge_footprint_records(
     authoritative: Iterable[FootprintRecord],
     inferred: Iterable[FootprintRecord],
@@ -163,38 +306,56 @@ def merge_footprint_records(
     minimum_area_m2: float = 5.0,
     authoritative_overlap: float = 0.62,
     duplicate_overlap: float = 0.88,
+    dedup_window: int | None = None,
+    report: DeduplicationReport | None = None,
+    envelope_padding_ratio: float = 0.02,
 ) -> list[FootprintRecord]:
     """Prioritize authoritative records and deduplicate inferred/source overlaps.
 
     OSM building features are passed as ``authoritative``; ML sources (Microsoft or
     Google) are passed as ``inferred``. The geometry and lineage of the retained
     record are kept together, so confidence is never detached from its footprint.
+
+    Duplicate detection is spatially indexed and unbounded in the number of
+    retained records, so dense fabric and large A0 sheets cannot hide a duplicate
+    beyond a fixed comparison window. ``dedup_window`` optionally caps the number
+    of most-recent records considered — an explicit, reported trade-off rather
+    than a silent one — and ``report`` receives resolution counters for the
+    build report.
     """
+    counters = report if report is not None else DeduplicationReport()
     authoritative_records = [r for r in authoritative if r.geometry.area >= 4.0]
+    counters.authoritative_in = len(authoritative_records)
+    inferred_records = list(inferred)
+    counters.inferred_in = len(inferred_records)
+
     merged = list(authoritative_records)
-    for candidate in inferred:
+    for candidate in inferred_records:
         if candidate.geometry.area < minimum_area_m2:
+            counters.dropped_below_minimum_area += 1
             continue
-        duplicate = any(
-            candidate.geometry.intersection(known.geometry).area
-            / max(min(candidate.geometry.area, known.geometry.area), 1e-8)
-            > authoritative_overlap
-            for known in authoritative_records
-        )
-        if not duplicate:
-            merged.append(candidate)
+        if _any_overlapping(authoritative_records, candidate, authoritative_overlap):
+            counters.dropped_as_authoritative_duplicate += 1
+            continue
+        merged.append(candidate)
+    counters.authoritative_kept = len(authoritative_records)
+
     merged.sort(key=lambda record: (-record.geometry.area, record.provider, record.source_id))
-    unique: list[FootprintRecord] = []
+    retain_all = dedup_window is None or dedup_window <= 0
+    counters.bounded_window = None if retain_all else int(dedup_window)
+    counters.index_filtered = True
+    index = _OverlapIndex(envelope_padding_ratio)
+    max_rank = None if retain_all else int(dedup_window)
     for candidate in merged:
-        duplicate = any(
-            candidate.geometry.intersection(previous.geometry).area
-            / max(min(candidate.geometry.area, previous.geometry.area), 1e-8)
-            > duplicate_overlap
-            for previous in unique[:120]
-        )
-        if not duplicate:
-            unique.append(candidate)
-    return unique
+        duplicate, compared, skipped = index.nearest_duplicate(candidate, duplicate_overlap, max_rank)
+        counters.candidates_compared += compared
+        counters.candidates_skipped_by_index += skipped
+        if duplicate is not None:
+            counters.dropped_as_duplicate += 1
+            continue
+        index.add(candidate)
+    counters.output_count = len(index._records)
+    return list(index._records)
 
 
 class MicrosoftFootprintProvider(BaseFootprintProvider):
