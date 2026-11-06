@@ -330,16 +330,33 @@ def test_indexed_merge_matches_reference_semantics(count):
 
 
 def test_oversized_footprint_among_small_ones_still_matches_reference():
-    """A warehouse larger than the bucket grid lands on the always-scanned list."""
+    """A warehouse larger than the bucket grid lands on the always-scanned list.
+
+    Under v1.8.0 the default policy is ``nested``, so the exhaustive reference
+    (which encodes absorption) is a parity oracle for the ``absorb`` policy only.
+    Both are asserted: the index must agree with the reference under absorb, and
+    must retain everything but the exact duplicate under the default.
+    """
+    from reconciliation import ContainmentPolicy, ReconciliationPolicy
+
     small = [_record((i % 50) * 20.0, (i // 50) * 20.0, 8.0, f"tile:s{i}") for i in range(300)]
     warehouse = _record(0, 0, 900.0, "tile:warehouse")
     duplicate = FootprintRecord(box(0, 0, 900, 400), "google-open-buildings", "tile:warehouse-dup", 0.9)
     payload = [*small, warehouse, duplicate]
 
-    result = merge_footprint_records([], payload)
-    assert [(record.source_id, round(record.geometry.area, 6)) for record in result] == _reference_merge(payload)
-    # The duplicate envelope is claimed once, by whichever tie-break wins.
-    assert sum(1 for record in result if record.geometry.bounds == warehouse.geometry.bounds) == 1
+    absorbing = merge_footprint_records(
+        [], payload, policy=ReconciliationPolicy(containment_policy=ContainmentPolicy.ABSORB)
+    )
+    assert [(record.source_id, round(record.geometry.area, 6)) for record in absorbing] == _reference_merge(payload)
+
+    nested = merge_footprint_records([], payload)
+    # `warehouse` is 900x900; `duplicate` is 900x400 inside it. The old scale-blind
+    # metric scored that containment as 1.0 and absorbed it despite only 44% outline
+    # coincidence (IoU), so v1.7.0 collapsed 302 -> 31. IoU now calls it containment,
+    # and nesting retains every footprint including the enclosed rectangle.
+    assert len(nested) == len(payload)
+    assert sum(1 for record in nested if record.geometry.bounds == warehouse.geometry.bounds) == 1
+    assert sum(1 for record in nested if record.geometry.bounds == duplicate.geometry.bounds) == 1
 
 
 # --- preserved behaviour --------------------------------------------------

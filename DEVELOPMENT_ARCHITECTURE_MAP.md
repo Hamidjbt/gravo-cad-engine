@@ -1,7 +1,7 @@
 # Development Architecture Map — `cad-fond-de-plan`
 
-**Current release:** 1.7.0  
-**Last updated:** 2026-11-05  
+**Current release:** 1.8.0  
+**Last updated:** 2026-11-06  
 **Package source:** `/home/user/skills/custom/cad-fond-de-plan/`  
 **Companion engineering log:** [`PRECISION_UPGRADE_AUDIT.md`](PRECISION_UPGRADE_AUDIT.md)
 
@@ -129,6 +129,36 @@ Release **1.7.0** replaces the fixed window with an incremental spatial hash:
 The merge is not merely faster or wider: parity tests assert identical output to the exhaustive
 reference algorithm across grid, randomised, mixed-size, and oversized-footprint inputs. A
 performance guard fails the suite if comparison counts regress toward exhaustive scanning.
+
+### Phase 9 — Explicit containment policy (1.8.0)
+
+The v1.7.0 milestone left one documented semantic question: a large footprint absorbed small ones it
+covered. Investigation showed the cause was not the threshold but the metric. `intersection ÷ min(area)`
+is maximal for containment *and* duplication alike (1.0000 versus 0.9996 on representative geometry),
+so no threshold value could distinguish them.
+
+Release **1.8.0** introduces `tools/reconciliation.py`:
+
+- **`OverlapMetrics`** — intersection, union, containment, IoU, and area ratio. IoU is what separates
+  the two phenomena, by three orders of magnitude.
+- **`ContainmentPolicy`** — `nested` (default, retain and report), `absorb` (historical), or
+  `absorb_when_coincident`. `nested` is the default because retention is reversible and deletion is not.
+- **`decide()`** — one place where classification becomes an action, with a human-readable reason.
+- **`ReconciliationLog` / `ReconciliationRecord`** — an auditable entry per non-distinct pair, ordered
+  deterministically so reports are reproducible.
+
+Both merge phases now use the classifier. Phase A no longer discards an inferred footprint that
+envelops authoritative records: it is retained and tagged `contains_authoritative`. Phase B routes
+containment through the policy instead of absorbing silently.
+
+Two earlier justifications were corrected during implementation: the merge was already
+order-independent (so no ordering fix was needed), and the authority phase was not an inversion but a
+mirror defect that deleted the *enveloping* record.
+
+`--containment-policy`, `--containment-threshold`, `--iou-duplicate`, and `--min-child-area-m2` are
+exposed on the CLI; MCP `generate_cad_plan` forwards `containment_policy` and returns
+`nested_pairs_reported`. `footprints.reconciliation.audit.consistent` asserts that every drop counted
+by deduplication carries a reconciliation record.
 
 ---
 
@@ -279,7 +309,7 @@ At inspection, `du -sh /home/user` was **774M**, and `find /home/user -type f | 
 
 ## 6. Current package and validation record
 
-- Skill/manifest version: **1.7.0**.
+- Skill/manifest version: **1.8.0**.
 - Portable ZIP: `/home/user/cad-fond-de-plan-skill.zip` (46,418 bytes; ZIP integrity and required modules verified).
 - Latest Drive backup: `cad-fond-de-plan-skill-1.4.2.zip`, ID `1G-5WKL9N6PpGndF5swgpa9RpL4x5bYVh`, 46,445 bytes.
 - Latest full regression run: **51 passed**; Python compilation and JSON parsing passed.

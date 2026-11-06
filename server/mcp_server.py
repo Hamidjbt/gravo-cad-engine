@@ -56,6 +56,14 @@ class FootprintProvider(str, Enum):
     GOOGLE_OPEN_BUILDINGS = "google-open-buildings"
 
 
+class ContainmentPolicyChoice(str, Enum):
+    """What to do when one footprint encloses another."""
+
+    NESTED = "nested"
+    ABSORB = "absorb"
+    ABSORB_WHEN_COINCIDENT = "absorb_when_coincident"
+
+
 class TargetPrecision(str, Enum):
     """Google Open Buildings published confidence tier (an *estimate*, not a guarantee)."""
 
@@ -87,6 +95,8 @@ class CadGenerationResult(BaseModel):
     applied_confidence_thresholds: list[float] = Field(default_factory=list)
     resolved_s2_cell_ids: list[str] = Field(default_factory=list)
     qa_contract_version: str
+    containment_policy: str = "nested"
+    nested_pairs_reported: int = 0
     warning: str = "Input imagery/data are not a cadastral survey; inspect provenance and QA report."
 
 
@@ -231,6 +241,15 @@ def generate_cad_plan(
     google_thresholds_file: Annotated[
         str | None, Field(description="Cached Google score-thresholds CSV; useful for offline runs")
     ] = None,
+    containment_policy: Annotated[
+        ContainmentPolicyChoice,
+        Field(
+            description=(
+                "Behaviour when one footprint encloses another: nested (default, retain both and "
+                "report), absorb, or absorb_when_coincident"
+            )
+        ),
+    ] = ContainmentPolicyChoice.NESTED,
 ) -> CadGenerationResult:
     """Generate a metric CAD plan around a coordinate at a requested sheet scale.
 
@@ -277,6 +296,7 @@ def generate_cad_plan(
         osm_file=resolved_osm_file,
         thresholds_file=resolved_thresholds,
     )
+    command += ["--containment-policy", containment_policy.value]
     try:
         completed = subprocess.run(
             command, cwd=_builder_path().parents[1], capture_output=True, text=True, timeout=900, check=False
@@ -309,6 +329,8 @@ def generate_cad_plan(
         applied_confidence_thresholds=footprints.get("applied_confidence_thresholds") or [],
         resolved_s2_cell_ids=footprints.get("resolved_s2_cell_ids") or [],
         qa_contract_version=_QA.QA_CONTRACT_VERSION,
+        containment_policy=str(containment_policy.value),
+        nested_pairs_reported=int(((footprints.get("reconciliation") or {}).get("nested_retained")) or 0),
     )
 
 

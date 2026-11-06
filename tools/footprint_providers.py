@@ -25,6 +25,17 @@ from acquisition import (
     SourceCapabilities,
 )
 from pyproj import Transformer
+from reconciliation import (
+    CLASS_DISTINCT,
+    DIRECTION_CONTAINED_BY,
+    DIRECTION_CONTAINS,
+    Classification,
+    ReconciliationLog,
+    ReconciliationPolicy,
+    ReconciliationRecord,
+    classify,
+    decide,
+)
 from shapely import make_valid, wkt
 from shapely import transform as shapely_transform
 from shapely.errors import ShapelyError
@@ -237,39 +248,48 @@ class _OverlapIndex:
 
     # -- operations ---------------------------------------------------------
 
-    def nearest_duplicate(
-        self, candidate: FootprintRecord, overlap_threshold: float, max_rank: int | None = None
-    ) -> tuple[FootprintRecord | None, int, int]:
-        """Return ``(duplicate_or_none, comparisons, skipped_by_index)``.
+    def nearest_match(
+        self, candidate: FootprintRecord, policy: ReconciliationPolicy, max_rank: int | None = None
+    ) -> tuple[_Resolution | None, int, int]:
+        """Find the strongest drop-worthy relationship for ``candidate``.
 
-        ``max_rank`` (exclusive) restricts eligibility to the first N retained
-        records, which reproduces the historical ``unique[:N]`` window exactly.
-        It exists only so callers can opt into a bounded scan explicitly.
+        Returns ``(resolution_or_none, comparisons, skipped_by_index)``. A
+        ``None`` resolution means no neighbour warranted action. Retained
+        containment matches are still returned so they can be reported.
         """
         if not self._records:
             return None, 0, 0
         keys = self._cells_for(self._padded(candidate.geometry))
         if not keys:
-            candidates = list(range(len(self._records)))
+            positions: list[int] = list(range(len(self._records)))
             skipped = 0
         else:
-            positions: set[int] = set(self._oversized)
+            gathered: set[int] = set(self._oversized)
             for key in keys:
                 bucket = self._cells.get(key)
                 if bucket:
-                    positions.update(bucket)
-            candidates = sorted(positions)
-            skipped = len(self._records) - len(candidates)
+                    gathered.update(bucket)
+            positions = sorted(gathered)
+            skipped = len(self._records) - len(positions)
         comparisons = 0
-        for position in candidates:
+        best_retained: _Resolution | None = None
+        for position in positions:
             if max_rank is not None and position >= max_rank:
                 skipped += 1
                 continue
             comparisons += 1
             previous = self._records[position]
-            if _overlap_ratio(candidate.geometry, previous.geometry) > overlap_threshold:
-                return previous, comparisons, skipped
-        return None, comparisons, skipped
+            classification = classify(candidate.geometry, previous.geometry, policy)
+            if classification.kind == CLASS_DISTINCT:
+                continue
+            drop, reason = decide(classification, policy)
+            resolution = _Resolution(drop=drop, reason=reason, classification=classification, known=previous)
+            if drop:
+                # A duplicate outranks any containment finding.
+                return resolution, comparisons, skipped
+            if best_retained is None:
+                best_retained = resolution
+        return best_retained, comparisons, skipped
 
     def add(self, record: FootprintRecord) -> None:
         self._ensure_cell_size(record.geometry)
@@ -284,21 +304,6 @@ class _OverlapIndex:
             self._cells.setdefault(key, []).append(position)
 
 
-def _overlap_ratio(candidate: Polygon, known: Polygon) -> float:
-    """Overlap as a fraction of the smaller footprint; 0.0 when either is degenerate."""
-    denominator = max(min(candidate.area, known.area), 1e-8)
-    return candidate.intersection(known).area / denominator
-
-
-def _any_overlapping(records: list[FootprintRecord], candidate: FootprintRecord, threshold: float) -> bool:
-    """Exact check against a small set (authoritative OSM records).
-
-    OSM extracts are bounded by the study radius, so an exhaustive scan here is
-    cheap and avoids any indexing approximation.
-    """
-    return any(_overlap_ratio(candidate.geometry, known.geometry) > threshold for known in records)
-
-
 def merge_footprint_records(
     authoritative: Iterable[FootprintRecord],
     inferred: Iterable[FootprintRecord],
@@ -309,37 +314,68 @@ def merge_footprint_records(
     dedup_window: int | None = None,
     report: DeduplicationReport | None = None,
     envelope_padding_ratio: float = 0.02,
+    policy: ReconciliationPolicy | None = None,
+    reconciliation: ReconciliationLog | None = None,
 ) -> list[FootprintRecord]:
-    """Prioritize authoritative records and deduplicate inferred/source overlaps.
+    """Reconcile authoritative and inferred footprints with explicit policy.
 
-    OSM building features are passed as ``authoritative``; ML sources (Microsoft or
-    Google) are passed as ``inferred``. The geometry and lineage of the retained
-    record are kept together, so confidence is never detached from its footprint.
+    OSM building features are passed as ``authoritative``; ML sources (Microsoft
+    or Google) are passed as ``inferred``. Geometry and lineage stay together, so
+    confidence is never detached from its footprint.
+
+    Two relationships are distinguished rather than conflated:
+
+    * **duplicate** — high IoU; one copy is dropped.
+    * **containment** — one footprint encloses another. What happens is decided by
+      ``policy.containment_policy``, defaulting to ``nested`` (keep both, report
+      the relation). ``absorb`` reproduces the historical behaviour.
+
+    Authoritative records are never dropped. An inferred footprint that merely
+    *contains* an authoritative one is retained and tagged
+    ``contains_authoritative``; previously it was discarded wholesale, which
+    deleted buildings that genuinely exist.
 
     Duplicate detection is spatially indexed and unbounded in the number of
-    retained records, so dense fabric and large A0 sheets cannot hide a duplicate
-    beyond a fixed comparison window. ``dedup_window`` optionally caps the number
-    of most-recent records considered — an explicit, reported trade-off rather
-    than a silent one — and ``report`` receives resolution counters for the
-    build report.
+    retained records. ``dedup_window`` optionally caps the search explicitly (the
+    bound is reported), and ``report``/``reconciliation`` receive counters and
+    auditable records for the build report.
     """
+    policy = policy or ReconciliationPolicy(
+        containment_threshold=duplicate_overlap,
+        authoritative_containment_threshold=authoritative_overlap,
+    )
     counters = report if report is not None else DeduplicationReport()
+    log = reconciliation if reconciliation is not None else ReconciliationLog(policy=policy)
+    log.policy = policy
+
     authoritative_records = [r for r in authoritative if r.geometry.area >= 4.0]
     counters.authoritative_in = len(authoritative_records)
     inferred_records = list(inferred)
     counters.inferred_in = len(inferred_records)
 
+    # -- phase A: inferred against authoritative ----------------------------
     merged = list(authoritative_records)
     for candidate in inferred_records:
         if candidate.geometry.area < minimum_area_m2:
             counters.dropped_below_minimum_area += 1
             continue
-        if _any_overlapping(authoritative_records, candidate, authoritative_overlap):
+        verdict = _resolve_against_authoritative(candidate, authoritative_records, policy)
+        if verdict.drop:
             counters.dropped_as_authoritative_duplicate += 1
+            _log_pair(log, "authority", candidate, verdict.known, verdict.classification, candidate, verdict.reason)
+            continue
+        if verdict.contains_authoritative:
+            tagged = _with_contains_authoritative(candidate, verdict.contained_ids)
+            merged.append(tagged)
+            log.contains_authoritative_tags.append(tagged.source_id)
+            _log_pair(log, "authority", tagged, verdict.known, verdict.classification, None, verdict.reason)
             continue
         merged.append(candidate)
+        if verdict.classification is not None:
+            _log_pair(log, "authority", candidate, verdict.known, verdict.classification, None, verdict.reason)
     counters.authoritative_kept = len(authoritative_records)
 
+    # -- phase B: dedup / containment among the merged set ------------------
     merged.sort(key=lambda record: (-record.geometry.area, record.provider, record.source_id))
     retain_all = dedup_window is None or dedup_window <= 0
     counters.bounded_window = None if retain_all else int(dedup_window)
@@ -347,15 +383,124 @@ def merge_footprint_records(
     index = _OverlapIndex(envelope_padding_ratio)
     max_rank = None if retain_all else int(dedup_window)
     for candidate in merged:
-        duplicate, compared, skipped = index.nearest_duplicate(candidate, duplicate_overlap, max_rank)
+        match, compared, skipped = index.nearest_match(candidate, policy, max_rank)
         counters.candidates_compared += compared
         counters.candidates_skipped_by_index += skipped
-        if duplicate is not None:
-            counters.dropped_as_duplicate += 1
+        if match is not None and match.drop:
+            if match.classification.is_duplicate:
+                counters.dropped_as_duplicate += 1
+            _log_pair(log, "dedup", candidate, match.known, match.classification, candidate, match.reason)
             continue
+        if match is not None and match.classification.is_containment:
+            _log_pair(log, "dedup", candidate, match.known, match.classification, None, match.reason)
         index.add(candidate)
     counters.output_count = len(index._records)
     return list(index._records)
+
+
+@dataclass(frozen=True)
+class _Resolution:
+    """Internal verdict for one candidate against its neighbours."""
+
+    drop: bool
+    reason: str
+    classification: Classification | None = None
+    known: FootprintRecord | None = None
+    contains_authoritative: bool = False
+    contained_ids: tuple[str, ...] = ()
+
+
+def _log_pair(
+    log: ReconciliationLog,
+    phase: str,
+    candidate: FootprintRecord,
+    known: FootprintRecord | None,
+    classification: Classification | None,
+    dropped_record: FootprintRecord | None,
+    reason: str,
+) -> None:
+    """Record one auditable decision.
+
+    ``parent`` is always the enclosing footprint and ``child`` the enclosed one.
+    ``dropped_record`` names which record the decision removed (``None`` when
+    nothing was dropped), so the record is unambiguous even when the dropped
+    record is the enclosing one.
+    """
+    if known is None or classification is None:
+        return
+    parent, child = (candidate, known) if classification.direction == DIRECTION_CONTAINS else (known, candidate)
+    log.add(
+        ReconciliationRecord(
+            phase=phase,
+            decision="dropped" if dropped_record is not None else "retained",
+            reason=reason,
+            dropped_source_id=dropped_record.source_id if dropped_record is not None else None,
+            parent_source_id=parent.source_id,
+            parent_provider=parent.provider,
+            parent_area_m2=float(parent.geometry.area),
+            child_source_id=child.source_id,
+            child_provider=child.provider,
+            child_area_m2=float(child.geometry.area),
+            classification=classification,
+        )
+    )
+
+
+def _with_contains_authoritative(record: FootprintRecord, ids: tuple[str, ...]) -> FootprintRecord:
+    attributes = dict(record.attributes)
+    attributes["contains_authoritative"] = list(ids)
+    return FootprintRecord(
+        record.geometry, record.provider, record.source_id, record.confidence, record.license, attributes
+    )
+
+
+def _resolve_against_authoritative(
+    candidate: FootprintRecord,
+    authoritative_records: list[FootprintRecord],
+    policy: ReconciliationPolicy,
+) -> _Resolution:
+    """Decide an inferred footprint's fate against the authoritative set.
+
+    Authoritative records are never dropped. The candidate is dropped only when it
+    duplicates an authoritative footprint or sits inside one; when it *envelops*
+    authoritative footprints it is retained and tagged.
+    """
+    drop_reason: str | None = None
+    contained_ids: list[str] = []
+    strongest: Classification | None = None
+    strongest_known: FootprintRecord | None = None
+    for known in authoritative_records:
+        classification = classify(candidate.geometry, known.geometry, policy)
+        if classification.kind == CLASS_DISTINCT:
+            continue
+        if classification.is_duplicate:
+            return _Resolution(
+                drop=True,
+                reason="duplicate of an authoritative footprint (high IoU)",
+                classification=classification,
+                known=known,
+            )
+        if classification.direction == DIRECTION_CONTAINED_BY:
+            drop_reason = "inferred footprint is inside an authoritative record"
+            strongest = strongest or classification
+            strongest_known = strongest_known or known
+        elif classification.direction == DIRECTION_CONTAINS:
+            contained_ids.append(known.source_id)
+            if strongest is None or classification.metrics.containment > strongest.metrics.containment:
+                strongest = classification
+                strongest_known = known
+    if drop_reason is not None:
+        return _Resolution(drop=True, reason=drop_reason, classification=strongest, known=strongest_known)
+    if contained_ids:
+        return _Resolution(
+            drop=False,
+            reason="inferred footprint contains authoritative record(s); retained and tagged",
+            classification=strongest,
+            known=strongest_known,
+            contains_authoritative=True,
+            contained_ids=tuple(sorted(contained_ids)),
+        )
+    return _Resolution(drop=False, reason="distinct footprints")
 
 
 class MicrosoftFootprintProvider(BaseFootprintProvider):

@@ -1,6 +1,6 @@
 # cad-fond-de-plan — urban morphology and metric CAD engine
 
-Version 1.7.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
+Version 1.8.0. This repository implements deterministic footprint/block topology, a level-aware road graph, R2018 DXF output, and A3/A1/A0 paper-space layouts. Project coordinates remain projected metres; the Oran/western-Algeria profile uses UTM 30N / EPSG:32630 where appropriate.
 
 See [`DEVELOPMENT_ARCHITECTURE_MAP.md`](DEVELOPMENT_ARCHITECTURE_MAP.md) for project history, layer schema, storage/quota guidance, and portability details. See [`SKILL.md`](SKILL.md) for operating rules and the source-data limitations.
 
@@ -80,6 +80,42 @@ tiers.
 ### CI
 
 `.github/workflows/ci.yml` runs `make test` and then `make lint` on push and pull request.
+
+## Containment policy (v1.8.0)
+
+Similarity used to be scored as `intersection ÷ min(area)`, which is maximal both when one footprint
+*contains* another and when two records describe the *same* building. An 8 m shop inside a 900 × 400 m
+warehouse scored 1.0000; a genuine duplicate scored 0.9996. The two cases were indistinguishable, so
+no threshold could separate them.
+
+Reconciliation now asks three separate questions — IoU (same building?), containment (nested?), and
+area ratio (scale disparity?) — and routes containment through a **declared policy**:
+
+| `--containment-policy` | Behaviour |
+|---|---|
+| `nested` *(default)* | Keep both, record the parent-child relation and metrics |
+| `absorb` | Drop the enclosed footprint (pre-v1.8.0 behaviour) |
+| `absorb_when_coincident` | Drop only when outlines are largely coincident |
+
+`nested` is the default because retention is non-destructive and reversible: a nested pair can be
+absorbed later with one flag, while a silently deleted building cannot be recovered from the output.
+
+Supporting flags: `--containment-threshold` (0.88), `--iou-duplicate` (0.80), and
+`--min-child-area-m2` (0.0, protects small structures from absorption).
+
+**Authoritative phase fixed.** An inferred footprint that merely *envelops* OSM records was
+discarded wholesale, deleting buildings that exist. It is now retained and tagged
+`contains_authoritative: ["osm:…"]`. An inferred footprint *inside* an authoritative one is still
+superseded, and authoritative records are never dropped under any policy.
+
+**Provenance.** `footprints.reconciliation` records the policy, counters, and one entry per
+non-distinct pair — parent and child source IDs, providers, areas, class, direction, IoU,
+containment, area ratio, the decision, the reason, and `dropped_source_id`. `audit.consistent`
+must be `true`: it asserts every drop counted by deduplication has a matching reconciliation record.
+
+Hierarchy roles (podium/courtyard/annex) are deliberately deferred until an authoritative height or
+semantic-tag signal exists; inferring them from geometry would replace a geometry decision with a
+silent semantic one.
 
 ## Scale-safe deduplication (v1.7.0)
 

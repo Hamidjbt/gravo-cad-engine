@@ -37,6 +37,7 @@ from footprint_providers import (
 from layout_engine import add_paperspace_viewport, metadata_from_utm, resolve_layout, resolve_sheet_set
 from PIL import Image
 from pyproj import Transformer
+from reconciliation import ContainmentPolicy, ReconciliationLog, ReconciliationPolicy
 from report_schema import apply_detail, input_provenance, provenance_block
 from scipy.spatial import cKDTree
 from shapely import make_valid, minimum_rotated_rectangle
@@ -47,7 +48,7 @@ from shapely.ops import transform
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.7.0"
+ENGINE_VERSION = "1.8.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -916,6 +917,26 @@ def qa_outputs(
     }
 
 
+def _reconciliation_report(log: ReconciliationLog | None, dedup: DeduplicationReport | None) -> dict | None:
+    """Summarise reconciliation, and fail loudly if its counts disagree with dedup.
+
+    A mismatch would mean a drop happened without an auditable record.
+    """
+    if log is None:
+        return None
+    summary = log.summary()
+    payload = {**summary, "pairs": log.sorted_pairs()}
+    if dedup is not None:
+        accounted = summary["duplicates_dropped"] + summary["absorbed"] + summary["authoritative_contained_dropped"]
+        expected = dedup.dropped_as_duplicate + dedup.dropped_as_authoritative_duplicate
+        payload["audit"] = {
+            "drops_expected": expected,
+            "drops_accounted_with_reason": accounted,
+            "consistent": accounted == expected,
+        }
+    return payload
+
+
 def build_footprint_summary(
     provider: BaseFootprintProvider,
     footprint_source: str,
@@ -928,6 +949,7 @@ def build_footprint_summary(
     thresholds_path: Path | None = None,
     thresholds_source: str = "not-requested",
     dedup_report: DeduplicationReport | None = None,
+    reconciliation: ReconciliationLog | None = None,
 ) -> dict:
     """Assemble report-ready footprint provenance, including threshold policy.
 
@@ -953,6 +975,7 @@ def build_footprint_summary(
         "unique_input_footprints_after_osm_merge": len(unique_records),
         "unique_input_counts_by_provider": source_counts,
         "deduplication": dedup_report.to_dict() if dedup_report is not None else None,
+        "reconciliation": _reconciliation_report(reconciliation, dedup_report),
         "final_output_footprints": len(building_provenance),
         "output_provenance": building_provenance,
     }
@@ -1087,7 +1110,20 @@ def build(args) -> dict:
     # OSM retains priority over near-identical inferred outlines; all records retain
     # their original source IDs/confidence through deduplication and topology.
     dedup_report = DeduplicationReport()
-    unique_records = merge_footprint_records(osm_records, provider_records, report=dedup_report)
+    reconciliation = ReconciliationLog()
+    reconciliation_policy = ReconciliationPolicy(
+        containment_policy=ContainmentPolicy.coerce(getattr(args, "containment_policy", "nested")),
+        containment_threshold=float(getattr(args, "containment_threshold", 0.88)),
+        iou_duplicate=float(getattr(args, "iou_duplicate", 0.80)),
+        min_child_area_m2=float(getattr(args, "min_child_area_m2", 0.0)),
+    )
+    unique_records = merge_footprint_records(
+        osm_records,
+        provider_records,
+        report=dedup_report,
+        policy=reconciliation_policy,
+        reconciliation=reconciliation,
+    )
     block_topology, ortho_sources, conservative_fallbacks, vacant_site_false_positives = regularize_footprint_records(
         unique_records, site, study_circle
     )
@@ -1172,6 +1208,7 @@ def build(args) -> dict:
         thresholds_path,
         thresholds_source,
         dedup_report,
+        reconciliation,
     )
     legacy_provider_report = {}
     if provider_name == "microsoft":
@@ -1349,6 +1386,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layout-sheet", choices=("A3", "A1", "A0"), help="add one exact-scale paper-space layout")
     p.add_argument(
         "--layout-scale", type=int, choices=(250, 500, 1000), help="layout denominator; requires --layout-sheet"
+    )
+    p.add_argument(
+        "--containment-policy",
+        choices=("nested", "absorb", "absorb_when_coincident"),
+        default="nested",
+        help="what to do when one footprint encloses another (default: nested, retain both and report)",
+    )
+    p.add_argument(
+        "--containment-threshold",
+        type=float,
+        default=0.88,
+        help="overlap-of-smaller-footprint needed to call a pair containment (default: 0.88)",
+    )
+    p.add_argument(
+        "--iou-duplicate",
+        type=float,
+        default=0.80,
+        help="intersection-over-union needed to call a pair a duplicate (default: 0.80)",
+    )
+    p.add_argument(
+        "--min-child-area-m2",
+        type=float,
+        default=0.0,
+        help="never absorb a contained footprint smaller than this area (default: 0.0)",
     )
     p.add_argument(
         "--report-detail",
