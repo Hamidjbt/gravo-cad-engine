@@ -13,13 +13,16 @@ quota-monitored workspace:
 from __future__ import annotations
 
 import json
+import os
 import stat
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from tools.egress_manager import (
     CHUNK_SIZE,
+    DEFAULT_BUFFER_ROOT,
     ArtifactEgress,
     ArtifactRecord,
     EgressError,
@@ -43,6 +46,22 @@ def _payload(path: Path, size: int) -> Path:
     return path
 
 
+def _scratch(name: str) -> Path:
+    """A scratch path that does not presume any particular host layout.
+
+    Tests used to name ``/var/tmp`` directly. That is a sandbox convention, not a
+    guarantee: on a CI runner ``/var/tmp`` may be absent or unwritable, and the test
+    would fail for a reason unrelated to the behaviour under test. Prefer the same
+    scratch root the engine itself would choose, and fall back to the pytest temp dir.
+    """
+    import egress_manager as _em
+
+    root = _em.DEFAULT_BUFFER_ROOT.parent
+    if not (root.is_dir() and os.access(root, os.W_OK)):
+        root = Path(tempfile.gettempdir())
+    return root / name
+
+
 # -- pure helpers ---------------------------------------------------------
 
 
@@ -62,7 +81,7 @@ def test_chunk_plan_never_exceeds_granularity():
 def test_sha256_streams_and_matches_hashlib_truth():
     import hashlib
 
-    path = _payload(Path("/var/tmp/egress-test-sha.bin"), 4096)
+    path = _payload(_scratch("egress-test-sha.bin"), 4096)
     try:
         assert sha256_file(path) == hashlib.sha256(path.read_bytes()).hexdigest()
     finally:
@@ -113,7 +132,10 @@ def test_resolve_sink_builds_drive_sink_from_service():
 def test_buffer_is_created_under_var_tmp_and_purged(tmp_path):
     with ArtifactEgress(destination="null", run_id="run-buffer-001", receipt_dir=tmp_path) as egress:
         buffer = egress.buffer
-        assert str(buffer).startswith("/var/tmp/gravo_egress_buffer/")
+        # Assert against the engine's own resolved root rather than a fixed host
+        # path, so the test holds wherever the scratch directory lives.
+        assert buffer.parent == DEFAULT_BUFFER_ROOT
+        assert str(buffer).startswith(str(DEFAULT_BUFFER_ROOT) + "/")
         assert buffer.is_dir()
         (buffer / "a.txt").write_text("hello", encoding="utf-8")
         assert buffer.exists()
@@ -232,7 +254,7 @@ def test_register_tree_names_files_relative_to_their_root(tmp_path):
 
 
 def test_success_flushes_hashes_and_pulses_a_receipt(tmp_path):
-    sink_dir = Path("/var/tmp/egress-test-sink")
+    sink_dir = _scratch("egress-test-sink")
     with ArtifactEgress(
         destination="local",
         run_id="run-success-001",
@@ -314,7 +336,7 @@ def test_unverified_remote_is_an_error_not_a_silent_pass(tmp_path):
 def test_declared_gdrive_destination_without_sessions_fails_closed(tmp_path):
     """A sink that cannot be built must fail before any work, leaving no scratch space."""
     run_id = "run-nocred-001"
-    buffer = Path("/var/tmp/gravo_egress_buffer") / run_id
+    buffer = DEFAULT_BUFFER_ROOT / run_id
     with pytest.raises(EgressError, match="resumable session URIs"):
         with ArtifactEgress(destination="gdrive", run_id=run_id, receipt_dir=tmp_path):
             pass  # pragma: no cover - enter() raises
@@ -357,7 +379,7 @@ def test_resumable_sink_streams_ordered_chunks_with_drive_headers(tmp_path, monk
     client = _RecordingClient()
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: client)
 
-    path = _payload(Path("/var/tmp/egress-test-chunks.bin"), 2 * CHUNK_SIZE + 5)
+    path = _payload(_scratch("egress-test-chunks.bin"), 2 * CHUNK_SIZE + 5)
     try:
         sink = ResumableSessionSink(
             {"chunks.bin": "https://upload.test/session"},
@@ -443,7 +465,7 @@ def test_resumable_sink_reports_rejected_chunk(tmp_path, monkeypatch):
 
 
 def test_full_lifecycle_leaves_only_the_receipt_in_monitored_tree(tmp_path):
-    window = Path("/var/tmp/egress-window-test")
+    window = _scratch("egress-window-test")
     if window.exists():
         import shutil as _shutil
 
@@ -454,7 +476,7 @@ def test_full_lifecycle_leaves_only_the_receipt_in_monitored_tree(tmp_path):
         destination="local",
         run_id="run-lifecycle-001",
         receipt_dir=window,
-        sink=LocalDirectorySink(Path("/var/tmp/egress-lifecycle-sink")),
+        sink=LocalDirectorySink(_scratch("egress-lifecycle-sink")),
     ) as egress:
         for index in range(5):
             egress.register(_payload(egress.output_dir() / f"sheet{index}.png", 64 * 1024))

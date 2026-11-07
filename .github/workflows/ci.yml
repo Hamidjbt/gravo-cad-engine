@@ -13,10 +13,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Two rules for this block, both learned the hard way:
+#
+#  1. No `runner.*` contexts. Only `github`, `inputs`, `secrets` and `vars` are
+#     available in a workflow-level `env:`. Referencing `runner.temp` here makes the
+#     whole file invalid and no job is ever created.
+#
+#  2. No `PIP_NO_CACHE_DIR`. It disables pip's cache process-wide, which breaks
+#     `pip cache dir`. Any step that asks pip about its cache — setup-python's
+#     `cache: pip` being the obvious one — then fails in seconds, before tests run.
+#     The Makefile disables the cache per invocation instead, which is the right scope.
 env:
-  # The suite must never reach the network: every HTTP surface is mocked.
-  PIP_NO_CACHE_DIR: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONDONTWRITEBYTECODE: "1"
   # Deterministic iteration order, independent of the runner's hash seed.
   PYTHONHASHSEED: "0"
@@ -31,24 +38,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Deliberately no `cache: pip`: `make test` builds its own throwaway virtualenv
+      # and installs with --no-cache-dir, so a restored pip cache would never be read.
+      # It would add a failure surface for no benefit.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip
 
       - name: Show toolchain
-        run: python --version && git --version
+        run: |
+          python --version
+          git --version
+          make --version | head -1
 
-      # The monitored tree does not exist on a runner. Point footprint accounting
-      # at throwaway space. This must stay at step level: the `runner` context is
-      # not available in a workflow-level `env:` block, and referencing it there
-      # makes the whole workflow invalid ("Unrecognized named-value: 'runner'").
+      # The monitored tree does not exist on a runner. Point footprint accounting at
+      # throwaway space. Must stay at step level, where the `runner` context exists.
       - name: Prepare the monitored workspace
         env:
           GRAVO_WORKSPACE: ${{ runner.temp }}/gravo-workspace
         run: mkdir -p "$GRAVO_WORKSPACE"
 
-      # Tests run before lint, matching the required local order.
+      # Tests run before lint, matching the required local order. `make test` builds
+      # its own virtualenv, so nothing is installed into the job's Python.
       - name: make test
         env:
           GRAVO_WORKSPACE: ${{ runner.temp }}/gravo-workspace
