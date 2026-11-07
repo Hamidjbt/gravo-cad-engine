@@ -166,6 +166,30 @@ class SheetPlacement:
         return w * self.scale / 1000.0, h * self.scale / 1000.0
 
     @property
+    def map_band_mm(self) -> tuple[float, float, float, float]:
+        """Usable map area in the SVG page frame: (x, y, w, h) with y down from the top.
+
+        ``usable_rect_mm`` states the same band in the y-up convention ("from the page's
+        bottom-left"), which is the right frame for reasoning about the cartouche
+        but the wrong one for a ``viewBox``. Rendering the geometry into ``map_band_mm``
+        while clipping to it is what stops the drawing being cut off at the top edge
+        and the title block landing on top of it.
+        """
+        ux, uy, uw, uh = self.usable_rect_mm
+        return (ux, self.page_h_mm - uy - uh, uw, uh)
+
+    @property
+    def content_center_m(self) -> tuple[float, float]:
+        """Centre of the content box in model metres.
+
+        The page is drawn centred on this point, so it is the anchor the grid
+        annotation needs: the ground actually covered is this centre plus half the
+        page extent (or half the study radius, whichever is smaller).
+        """
+        minx, miny, maxx, maxy = self.content_m
+        return (minx + maxx) / 2.0, (miny + maxy) / 2.0
+
+    @property
     def aspect_ratio(self) -> float:
         return self.page_w_mm / self.page_h_mm
 
@@ -227,11 +251,15 @@ def resolve_placement(
         page_h_mm=page_h,
         scale=int(scale),
         margin_mm=float(margin_mm),
-        # Centre of the usable rect, expressed in the page's y-up convention: the map
-        # occupies margin + titleblock .. page_h - margin.
+        # Centre of the usable rect, in the SVG page frame the geometry is drawn in.
+        # That frame has y increasing DOWNWARD from the page top, and the usable band
+        # occupies y = margin .. margin + usable_h. The cartouche band sits *below* it,
+        # anchored to the paper's bottom edge exactly as the DXF paperspace anchors
+        # ``cartouche_rect_mm`` — the two artifacts are then the same page rather than
+        # vertical mirror images of one another.
         origin_mm=(
             margin_mm + usable_w / 2.0 - cx * mm_per_m,
-            margin_mm + tb_h + usable_h / 2.0 + cy * mm_per_m,
+            margin_mm + usable_h / 2.0 + cy * mm_per_m,
         ),
         content_m=(minx, miny, maxx, maxy),
         titleblock_mm=(float(tb_w), float(tb_h)),
@@ -301,7 +329,8 @@ def cartouche_text(metadata: dict[str, Any], scale: int) -> list[str]:
             if metadata.get("ground_area_m2") is not None
             else "GROUND AREA: NOT SPECIFIED"
         ),
-        f"SCALE 1:{scale}  |  {metadata.get('date', '')}",
+        # A separator with nothing after it prints as a stray "|" in the cartouche.
+        f"SCALE 1:{scale}" + (f"  |  {metadata['date']}" if metadata.get("date") else ""),
     ]
 
 

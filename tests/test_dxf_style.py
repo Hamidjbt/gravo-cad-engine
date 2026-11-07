@@ -396,3 +396,114 @@ def test_dxf_output_is_byte_deterministic(tmp_path):
     second = render(tmp_path / "b.dxf")
     assert first == second, "DXF bytes vary between runs of identical input"
     assert len(first) == len(second)
+
+
+def test_dxf_output_is_stable_across_processes_and_hash_seeds(tmp_path):
+    """The same drawing must be byte-identical in *different* processes.
+
+    The in-process test above cannot catch order that depends on Python's per-process
+    hash seed. ezdxf writes the CLASSES section in dict iteration order, so two builds
+    of the same drawing listed ``LAYOUT`` and ``ACDBPLACEHOLDER`` in opposite orders —
+    a real failure that produced different bytes, and once a different byte count, which
+    a size-declared resumable upload rejects outright. Each subprocess below therefore
+    runs with a different ``PYTHONHASHSEED``.
+    """
+    import os
+    import subprocess
+    import sys
+
+    script = tmp_path / "render.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import sys",
+                f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / 'tools')!r})",
+                "import importlib",
+                "from pathlib import Path",
+                "from shapely.geometry import Polygon",
+                "build_mod = importlib.import_module('cad-fond-de-plan-build')",
+                "def sq(x, y, s):",
+                "    return [(x, y), (x + s, y), (x + s, y + s), (x, y + s)]",
+                "out = Path(sys.argv[1])",
+                "build_mod.write_dxf(",
+                "    out,",
+                "    buildings=[Polygon(sq(0, 0, 20), [sq(7, 7, 6)])],",
+                "    road_boundaries=None,",
+                "    parcels=[],",
+                "    site=Polygon(sq(-50, -50, 200)),",
+                "    hatch_geoms=[],",
+                "    epsg=32630,",
+                "    center=(0.0, 0.0),",
+                "    scale_mm_m=1.0,",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = []
+    for seed in ("0", "1", "12345"):
+        target = tmp_path / f"seed-{seed}.dxf"
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        subprocess.run(
+            [sys.executable, str(script), str(target)],
+            check=True,
+            capture_output=True,
+            env=env,
+            cwd=str(tmp_path),
+        )
+        rendered.append(target.read_bytes())
+
+    assert rendered[0] == rendered[1] == rendered[2], (
+        "DXF bytes depend on PYTHONHASHSEED: object order is being written in hash order"
+    )
+
+
+def test_pdf_render_is_byte_deterministic(tmp_path):
+    """Two PDF renders must be byte-identical, and must still be a valid A1 page.
+
+    Cairo writes the wall-clock time into the PDF creation date. Those changing digits
+    shift the deflate-compressed object stream by a byte, so the same sheet came out
+    49,112 bytes one run and 49,113 the next. A size-declared resumable upload cannot
+    survive that: the session demands the exact count before the file exists.
+    """
+    import importlib
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    build_mod = importlib.import_module("cad-fond-de-plan-build")
+
+    svg = tmp_path / "sheet.svg"
+    svg.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="841mm" height="594mm" '
+        'viewBox="0 0 841 594"><rect x="10" y="10" width="100" height="50" '
+        'fill="none" stroke="black"/><text x="20" y="40">A1</text></svg>',
+        encoding="utf-8",
+    )
+
+    first_pdf = tmp_path / "a.pdf"
+    second_pdf = tmp_path / "b.pdf"
+    build_mod._deterministic_pdf(svg, first_pdf)
+    build_mod._deterministic_pdf(svg, second_pdf)
+
+    first = first_pdf.read_bytes()
+    second = second_pdf.read_bytes()
+    assert first == second, "PDF bytes vary between runs: creation date is not pinned"
+    assert len(first) == len(second)
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(first_pdf), strict=True)
+    # The real contract: the date is pinned, not merely equal between two renders that
+    # happen to land in the same second. Renders a second apart differ otherwise.
+    creation_date = (reader.metadata or {}).get("/CreationDate")
+    assert creation_date == "D:19700101000000Z", (
+        f"PDF creation date is {creation_date!r}: renderer time was not pinned, so the "
+        "byte count can shift by a byte between runs"
+    )
+    page = reader.pages[0]
+    width_mm = float(page.mediabox.width) / 72 * 25.4
+    height_mm = float(page.mediabox.height) / 72 * 25.4
+    assert abs(width_mm - 841) < 1.5 and abs(height_mm - 594) < 1.5, (
+        f"page is {width_mm:.1f}x{height_mm:.1f} mm, expected A1 landscape 841x594"
+    )

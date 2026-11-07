@@ -120,10 +120,18 @@ def test_portrait_page_reanchors_the_cartouche_on_the_bottom_edge():
 def test_placement_centres_content_on_the_page():
     placement = le.resolve_placement((-50, -50, 50, 50), sheet="A3", scale=500)
     ox, oy = placement.origin_mm
-    # The content centre (0,0) must land at the centre of the usable rect.
+    # The content centre (0,0) must land at the centre of the usable rect, measured in
+    # the frame the geometry is actually drawn in: y increases downward from the page
+    # top and the map band runs margin .. margin + usable_h. usable_rect_mm reports the
+    # same band in the mirrored y-up convention, so it is converted rather than used
+    # directly -- otherwise this test passes while the drawing prints upside-down.
     ux, uy, uw, uh = placement.usable_rect_mm
+    mx, my, mw, mh = placement.map_band_mm
     assert ox == pytest.approx(ux + uw / 2)
-    assert oy == pytest.approx(uy + uh / 2)
+    assert oy == pytest.approx(my + mh / 2)
+    # The two rectangles describe one band; they differ only by the vertical mirror.
+    assert mw == pytest.approx(uw) and mh == pytest.approx(uh)
+    assert my + mh == pytest.approx(placement.page_h_mm - uy)
 
 
 def test_custom_page_must_not_claim_an_iso_name():

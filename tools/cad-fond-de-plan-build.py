@@ -60,10 +60,11 @@ from shapely.affinity import rotate
 from shapely.affinity import scale as scale_affine
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import transform
+from sheet_annotations import add_sheet_annotations
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.11.0"
+ENGINE_VERSION = "1.12.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -734,6 +735,8 @@ def write_svg(
     hatch_geoms: list[LineString],
     placement,
     hatched: bool,
+    metadata: dict | None = None,
+    pad_m: float = 0.0,
 ):
     """Write one true-to-scale sheet.
 
@@ -748,7 +751,7 @@ def write_svg(
     dwg.add(dwg.rect(insert=(0, 0), size=(page_w, page_h), fill="#FFFFFF"))
     # Clip the map to the usable area: content beyond the margins must be cut, never
     # squeezed, or the plot would silently print at the wrong scale.
-    ux, uy, uw, uh = placement.usable_rect_mm
+    ux, uy, uw, uh = placement.map_band_mm
     # svgwrite returns the added element, but defs.add() does not nest for us: the rect
     # must be a child of the clipPath or the url(#USABLE_AREA) reference resolves to
     # nothing and the sheet is silently unclipped.
@@ -810,6 +813,12 @@ def write_svg(
         )
         g_site.add(dwg.path(d=svg_path_polygon(site, placement)))
         map_group.add(g_site)
+    # The DXF has always carried a cartouche, north arrow and UTM grid in its
+    # paperspace layout, but the rendered sheet showed the drawing alone and the
+    # reserved title-block band came back blank. Compositing the same annotation
+    # here means a plotted PDF needs no AutoCAD round-trip to acquire a title block.
+    if metadata is not None:
+        add_sheet_annotations(dwg, placement, metadata, pad_m=pad_m)
     dwg.save(pretty=True)
 
 
@@ -830,13 +839,40 @@ def canonicalize_dxf_text(text: str) -> str:
     return _DXF_GUID.sub("{00000000-0000-0000-0000-000000000000}", text)
 
 
+#: The CLASSES section is a flat list of ``0/CLASS ... 281/0`` records. ezdxf emits them
+#: in the iteration order of a dict keyed by class name, which is seeded per process, so
+#: two runs of the same drawing listed ``LAYOUT`` and ``ACDBPLACEHOLDER`` in opposite
+#: orders. Nothing references a class record by position, so sorting them is safe.
+_DXF_CLASS_RECORD = re.compile(r"^(  0\nCLASS\n.*?^281\n0\n)", re.DOTALL | re.MULTILINE)
+
+
+def _canonicalise_object_order(text: str) -> str:
+    """Sort the CLASSES section into a stable order.
+
+    Class records are independent declarations; their relative order carries no
+    meaning, but ezdxf writes them in per-process hash order, which made every run
+    produce a different file. Sorting here rather than demanding ``PYTHONHASHSEED``
+    from whoever runs the build, because a build must not depend on how its
+    environment was launched.
+    """
+    records = _DXF_CLASS_RECORD.findall(text)
+    if len(records) < 2:
+        return text
+    ordered = sorted(records)
+    if ordered == records:
+        return text
+    iterator = iter(ordered)
+    return _DXF_CLASS_RECORD.sub(lambda _m: next(iterator), text)
+
+
 def save_dxf_deterministic(doc, path: Path) -> None:
-    """Write ``doc`` to ``path`` with volatile metadata canonicalised."""
+    """Write ``doc`` to ``path`` with volatile metadata and object order canonicalised."""
     import io as _io
 
     buffer = _io.StringIO()
     doc.write(buffer)
-    path.write_text(canonicalize_dxf_text(buffer.getvalue()), encoding=doc.output_encoding)
+    text = canonicalize_dxf_text(buffer.getvalue())
+    path.write_text(_canonicalise_object_order(text), encoding=doc.output_encoding)
 
 
 def add_dxf_polyline(msp, ring, close: bool, layer: str):
@@ -1050,7 +1086,49 @@ def render_sheet(hollow_svg: Path, hatched_svg: Path, out_png: Path, out_pdf: Pa
     )
     with Image.open(out_png) as im:
         im.save(out_png, dpi=(300, 300), optimize=True)
-    cairosvg.svg2pdf(url=str(hatched_svg), write_to=str(out_pdf), dpi=96)
+    _deterministic_pdf(hatched_svg, out_pdf)
+
+
+#: Cairo stamps its own creation date into the PDF xref stream, so two runs of the
+#: same sheet differ by a byte or two. That is fatal for a size-declared resumable
+#: upload: the session must know the exact byte count before the file exists.
+_PDF_DATE = re.compile(rb"(D:)\d{14}Z")
+
+
+def _deterministic_pdf(svg: Path, out_pdf: Path) -> None:
+    """Render ``svg`` to a byte-reproducible PDF.
+
+    Cairo stamps the wall-clock time into the document creation date, and because those
+    digits change every second the deflate-compressed object stream holding them comes
+    out a byte or two shorter or longer each run. That single byte is fatal to a
+    size-declared resumable upload, which must know the exact byte count before the
+    file exists — so the PDF is rendered to a scratch file and rewritten with the date
+    pinned. The rewrite clones the page tree verbatim (verified pixel-identical and
+    strictly parseable), so this changes metadata only, never the drawing.
+
+    Cairo ignores ``SOURCE_DATE_EPOCH`` in this build (measured: dates still tracked the
+    wall clock with it set), which is why the date is fixed after rendering instead.
+    """
+    import io
+
+    import cairosvg
+    from pypdf import PdfReader, PdfWriter
+
+    scratch = out_pdf.with_suffix(".render.pdf")
+    try:
+        cairosvg.svg2pdf(url=str(svg), write_to=str(scratch), dpi=96)
+        reader = PdfReader(str(scratch))
+        writer = PdfWriter(clone_from=reader)
+        metadata = {
+            key: value for key, value in (reader.metadata or {}).items() if key not in ("/CreationDate", "/ModDate")
+        }
+        metadata["/CreationDate"] = "D:19700101000000Z"
+        writer.metadata = metadata
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        out_pdf.write_bytes(buffer.getvalue())
+    finally:
+        scratch.unlink(missing_ok=True)
 
 
 def _page_aspect_findings(out_dir: Path, page_mm: tuple[float, float]) -> list[str]:
@@ -1431,8 +1509,34 @@ def _build_core(args, out_dir: Path) -> dict:
         hatch_geoms.extend(line_hatches(poly, hatch_spacing_m))
     hollow = out_dir / "fond-de-plan-hollow.svg"
     hatched = out_dir / "fond-de-plan-hatched.svg"
-    write_svg(hollow, buildings, road_boundaries, parcels, site, [], sheet_placement, False)
-    write_svg(hatched, buildings, road_boundaries, parcels, site, hatch_geoms, sheet_placement, True)
+    # One metadata record feeds both the DXF paperspace cartouche and the composited
+    # SVG/PDF one, so the two artifacts can never state different coordinates.
+    area_for_title = float(site.area) if site is not None and not site.is_empty else None
+    sheet_metadata = metadata_from_utm(cx, cy, epsg, area_for_title)
+    write_svg(
+        hollow,
+        buildings,
+        road_boundaries,
+        parcels,
+        site,
+        [],
+        sheet_placement,
+        False,
+        metadata=sheet_metadata,
+        pad_m=radius,
+    )
+    write_svg(
+        hatched,
+        buildings,
+        road_boundaries,
+        parcels,
+        site,
+        hatch_geoms,
+        sheet_placement,
+        True,
+        metadata=sheet_metadata,
+        pad_m=radius,
+    )
     layout_bounds_m = (
         tuple(site.bounds)
         if not site.is_empty
