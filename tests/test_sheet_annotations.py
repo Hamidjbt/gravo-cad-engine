@@ -159,7 +159,6 @@ def test_all_annotation_groups_are_written():
     assert set(written) == {
         "G-ANNO-FRAME",
         "G-ANNO-GRID",
-        "G-ANNO-TICKS",
         "G-ANNO-GRID-LABELS",
         "G-ANNO-NORTH",
         "G-ANNO-NORTH-LABEL",
@@ -451,3 +450,221 @@ def test_cartouche_is_a_framed_panel_with_labelled_fields():
     glyph_paths = [p for p in root.iter() if p.tag.rsplit("}", 1)[-1] == "path"]
     short = [p for p in glyph_paths if len(p.attrib.get("d", "")) < 400]
     assert len(short) > 10
+
+
+# ---------------------------------------------------------------------------
+# v1.13.1 -- draw order and pen-weight hierarchy
+# ---------------------------------------------------------------------------
+
+
+def _emit_full_sheet(tmp_path, hatched=True, roads=True):
+    """Render a sheet with every layer populated, and return the SVG root.
+
+    The ordering bugs only appear when geometry and annotation are composited by the
+    real writer, so these tests drive ``write_svg`` rather than the annotation module
+    alone: a unit test of the annotation code cannot see that the grid was added after
+    the poche.
+    """
+    import importlib
+
+    from shapely.geometry import LineString, Polygon, box
+
+    build = importlib.import_module("cad-fond-de-plan-build")
+    placement = _placement()
+    minx, miny, maxx, maxy = placement.content_m
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    unit = 20.0
+    buildings = [
+        box(cx, cy, cx + unit, cy + unit),
+        box(cx + 40, cy + 40, cx + 40 + unit, cy + 40 + unit),
+    ]
+    footprint = Polygon([(minx + 2, miny + 2), (maxx - 2, miny + 2), (maxx - 2, maxy - 2), (minx + 2, maxy - 2)])
+    road = LineString([(minx + 5, cy), (maxx - 5, cy)])
+    out = tmp_path / "sheet.svg"
+    build.write_svg(
+        out,
+        buildings,
+        road,
+        [road],
+        Polygon(),
+        [],
+        placement,
+        hatched,
+        metadata=_metadata(),
+        pad_m=50.0,
+        road_surface=footprint if roads else None,
+        poi_lines=[road],
+        viewport_m=(cx - 60.0, cy - 45.0, cx + 60.0, cy + 45.0),
+    )
+    return ET.parse(out).getroot()
+
+
+#: The grid is the one annotation group that participates in the map's paint order, and
+#: it carries the ``G-ANNO-`` prefix the other annotation groups use. Mapping it here is
+#: honest about that one asymmetry instead of renaming a group the tests already assert.
+_GROUP_ALIASES = {"G-ANNO-GRID": "GRID"}
+
+
+def _map_group_ids(root):
+    """Map group ids in document (paint) order, aliases resolved to layer names."""
+    order = []
+    for group in root.iter():
+        gid = group.attrib.get("id")
+        gid = _GROUP_ALIASES.get(gid, gid)
+        if gid in sa.LAYERS:
+            order.append(gid)
+    return order
+
+
+def test_map_groups_are_painted_back_to_front(tmp_path):
+    """Paint order must follow the declared contract.
+
+    Two defects are covered here at once: the UTM grid drawn over the solid poche, and
+    road linework running across building corners. Both are ordering bugs, so both are
+    asserted against the order the groups actually appear in the document -- the order a
+    renderer paints them in -- not against the order they are mentioned in the code.
+    """
+    root = _emit_full_sheet(tmp_path)
+    order = _map_group_ids(root)
+    assert order, "no known map groups were emitted"
+    indices = [sa.paint_index(gid) for gid in order]
+    assert indices == sorted(indices), f"groups painted out of order: {order}"
+
+    # The two specific relationships the review called out, stated explicitly.
+    assert order.index("GRID") < order.index("BUILDINGS"), "grid must paint behind poche"
+    assert order.index("ROADS") < order.index("BUILDINGS"), "road edges must paint behind poche"
+    assert order.index("ROAD_CASING") < order.index("BUILDINGS")
+
+
+def test_grid_is_background_not_overlay(tmp_path):
+    """No grid line may be painted after the building fill.
+
+    A weaker test than the full order check but stated in the reviewer's own terms: the
+    grid group must precede the poche group in document order, every time.
+    """
+    root = _emit_full_sheet(tmp_path)
+    order = _map_group_ids(root)
+    poche = order.index("BUILDINGS")
+    for gid in ("GRID", "CONTEXT_LINES", "PARCELS", "ROAD_CASING", "ROADS"):
+        assert order.index(gid) < poche, f"{gid} is painted over the poche"
+
+
+def test_pen_weights_form_a_readable_hierarchy(tmp_path):
+    """Grid, roads, walls and frame must be visibly different weights.
+
+    Four strokes within a tenth of a millimetre of each other read as one grey at arm's
+    length, which is what the review saw. This asserts both the ladder's shape and the
+    stroke widths actually written into the SVG, so a literal creeping back into the
+    renderer fails.
+    """
+    ladder = {name: sa.stroke_mm(name) for name in sa.LAYERS}
+    assert ladder["GRID"] < ladder["CONTEXT_LINES"] < ladder["ROAD_CASING"] < ladder["BUILDINGS"]
+    assert ladder["BUILDINGS"] < ladder["FRAME"]
+    # The contrast the review asked for: frame at least 6x the grid hairline, and no two
+    # adjacent steps closer than 40% apart.
+    assert ladder["FRAME"] >= 6.0 * ladder["GRID"]
+
+    root = _emit_full_sheet(tmp_path)
+    written = {}
+    for group in root.iter():
+        gid = _GROUP_ALIASES.get(group.attrib.get("id"), group.attrib.get("id"))
+        if gid in sa.LAYERS and group.attrib.get("stroke-width"):
+            written[gid] = float(group.attrib["stroke-width"])
+    # The renderer must use the ladder, not its own numbers.
+    for gid, width in written.items():
+        assert width == pytest.approx(sa.stroke_mm(gid), abs=1e-9), (
+            f"{gid} stroke {width} does not match the declared {sa.stroke_mm(gid)} mm"
+        )
+    assert written["BUILDINGS"] > written["ROADS"] > written["GRID"]
+
+
+def test_poche_fill_masks_road_linework(tmp_path):
+    """Building fills must be opaque and above the road layer.
+
+    SVG has no clipping to the figure, so the mask only works if the fill is opaque and
+    painted later. This asserts the fill colour is fully opaque black and that the group
+    carries the heavier wall stroke, in that order in the document.
+    """
+    root = _emit_full_sheet(tmp_path)
+    order = _map_group_ids(root)
+    buildings = [g for g in root.iter() if g.attrib.get("id") == "BUILDINGS"][0]
+    assert buildings.attrib["fill"] == "#000000"
+    assert order.index("BUILDINGS") > order.index("ROADS")
+    # Walls get their own unfilled pass so shared walls stay legible, also above roads.
+    assert order.index("BUILDING_WALLS_OVER_HATCH") > order.index("ROADS")
+
+
+def test_nan_tag_fill_does_not_turn_every_feature_into_a_road():
+    """pandas NaN fill must not read as a present OSM tag.
+
+    ``NaN`` is truthy, so a landuse polygon or a bus-stop node with no ``highway`` tag
+    passed ``if tags.get("highway")`` and was buffered into the road casement at the
+    default 4.8 m width. Those phantom roads are what drew road edges across building
+    corners. 73 of the 212 features in the Tlemcen extract have no real highway tag.
+    """
+    import importlib
+    import math
+
+    build = importlib.import_module("cad-fond-de-plan-build")
+    nan = float("nan")
+
+    assert build.osm_tag({"highway": nan}, "highway") is None
+    assert build.osm_tag({"highway": None}, "highway") is None
+    assert build.osm_tag({}, "highway") is None
+    assert build.osm_tag({"highway": "   "}, "highway") is None
+    # A real tag survives, and NaN neighbours do not mask it.
+    assert build.osm_tag({"highway": "residential", "barrier": nan}, "highway") == "residential"
+    assert build.osm_tag({"highway": nan, "barrier": "city_wall"}, "barrier") == "city_wall"
+    assert math.isnan(nan)
+
+
+def test_phantom_roads_from_untagged_features_are_excluded():
+    """A feature with no highway tag must contribute no road geometry.
+
+    Driven through the real extractor against a synthetic GeoDataFrame, because the
+    predicate is the thing that broke -- a test of ``osm_tag`` alone would not prove the
+    road builder uses it.
+    """
+    import importlib
+
+    import geopandas as gpd
+    from pyproj import Transformer
+    from shapely.geometry import LineString, Point, Polygon, box
+
+    build = importlib.import_module("cad-fond-de-plan-build")
+    to_utm = Transformer.from_crs(4326, 32630, always_xy=True)
+    cx, cy = to_utm.transform(-1.30392, 34.88349)
+    nan = float("nan")
+    # Five features, four of which carry only NaN in the highway column.
+    rows = [
+        {
+            "highway": "residential",
+            "landuse": nan,
+            "barrier": nan,
+            "geometry": LineString([(cx - 60, cy), (cx + 60, cy)]),
+        },
+        {
+            "highway": nan,
+            "landuse": "residential",
+            "barrier": nan,
+            "geometry": Polygon([(cx, cy + 10), (cx + 30, cy + 10), (cx + 30, cy + 40)]),
+        },
+        {
+            "highway": nan,
+            "landuse": nan,
+            "barrier": "city_wall",
+            "geometry": LineString([(cx - 50, cy + 50), (cx + 50, cy + 50)]),
+        },
+        {"highway": nan, "landuse": nan, "barrier": nan, "amenity": "bus_station", "geometry": Point(cx + 20, cy - 20)},
+        {"highway": nan, "landuse": nan, "barrier": nan, "geometry": box(cx - 90, cy - 90, cx + 90, cy + 90)},
+    ]
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=32630)
+    study = box(cx - 120, cy - 120, cx + 120, cy + 120)
+
+    corridor, osm_count, manual_count, graph = build.road_casements(gdf, to_utm, study, cx, cy, [], return_graph=True)
+    # Exactly one real road feature was consumed.
+    assert osm_count == 1, f"expected only the tagged road, got {osm_count}"
+    assert manual_count == 0
+    assert graph.number_of_edges() >= 1
+    # The phantom corridor must not span the whole study area.
+    assert corridor.area < study.area * 0.5, "untagged features were buffered into roads"

@@ -60,11 +60,11 @@ from shapely.affinity import rotate
 from shapely.affinity import scale as scale_affine
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import transform
-from sheet_annotations import add_sheet_annotations
+from sheet_annotations import add_sheet_annotations, add_sheet_backdrop, stroke_mm
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.13.0"
+ENGINE_VERSION = "1.13.1"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -572,6 +572,26 @@ def image_lines(cx, cy, anchor, gsd) -> tuple[list[tuple[LineString, float]], li
     return roads, parcels, site
 
 
+def osm_tag(tags: dict, key: str):
+    """Read one OSM tag, treating pandas' NaN fill as "absent".
+
+    When OSM ways of different kinds are loaded together, the tag columns are unioned and
+    every feature that lacks a tag gets ``NaN``. ``NaN`` is *truthy* in Python, so
+    ``if tags.get("highway")`` is true for a polygon with no highway tag at all: 73 of the
+    212 features in the Tlemcen extract have no real highway tag but were still buffered
+    into the road casement at the default 4.8 m residential width. That is what put road
+    edges across building corners. Every tag read goes through here.
+    """
+    value = tags.get(key)
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def road_width(tags: dict) -> float:
     highway = str(tags.get("highway", "residential"))
     widths = {
@@ -619,7 +639,7 @@ def road_casements(
     osm_count = manual_count = 0
     source_crs = osm.crs.to_epsg() if osm.crs is not None else None
     for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
-        if geom is None or not tags.get("highway"):
+        if geom is None or osm_tag(tags, "highway") is None:
             continue
         projected = transform(to_utm.transform, geom) if source_crs == 4326 else geom
         # OSM centerlines are inaccurate in the locally imaged block; use the explicit
@@ -655,7 +675,11 @@ def extract_parcels(
     for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
         if geom is None:
             continue
-        if tags.get("landuse") or tags.get("barrier") or tags.get("natural"):
+        if (
+            osm_tag(tags, "landuse") is not None
+            or osm_tag(tags, "barrier") is not None
+            or osm_tag(tags, "natural") is not None
+        ):
             projected = transform(to_utm.transform, geom) if osm.crs.to_epsg() == 4326 else geom
             if projected.geom_type in ("Polygon", "MultiPolygon"):
                 projected = projected.boundary
@@ -691,9 +715,9 @@ def extract_context_lines(osm: gpd.GeoDataFrame, to_utm: Transformer, study_area
             continue
         if not any(tags.get(key) for key in _CONTEXT_TAG_KEYS):
             continue
-        if tags.get("highway"):
+        if osm_tag(tags, "highway") is not None:
             continue  # already carried by the road casement
-        if tags.get("building") or tags.get("building:part"):
+        if osm_tag(tags, "building") is not None or osm_tag(tags, "building:part") is not None:
             continue
         projected = transform(to_utm.transform, geom) if source_crs == 4326 else geom
         clipped = projected.intersection(study_area)
@@ -803,57 +827,86 @@ def write_svg(
     dwg.defs.add(clip)
     map_group = dwg.g()
     map_group.attribs["clip-path"] = "url(#USABLE_AREA)"
+    # Paint order is stated once, back to front, and asserted by
+    # tests/test_sheet_annotations.py::test_map_groups_are_painted_back_to_front:
+    #   grid -> context lines -> parcels -> road casing -> road edges
+    #        -> building poche -> site boundary -> frame
+    # Grid first means the survey hairlines sit *under* the drawing; poche above the
+    # road linework means any road edge crossing a footprint is cleanly masked by the
+    # building instead of cutting across its corner.
+    if metadata is not None:
+        backdrop_viewport = None if viewport_m is None else tuple(viewport_m)
+        add_sheet_backdrop(dwg, placement, pad_m=pad_m, viewport_m=backdrop_viewport)
     dwg.add(map_group)
-    # Road hierarchy, drawn back-to-front: the casing is the road surface, the centreline
-    # is the kerb boundary. Filling the casement is what gives the plan an urban context
-    # instead of buildings floating on blank paper -- an unfilled outline of a road
-    # network at 1:1000 reads as stray lines, not as streets.
-    if road_surface is not None:
-        # The sheet contract is strictly monochrome (fill must be #000000, #FFFFFF or
-        # none), so the roadway cannot be a grey tone. It is drawn the way a voirie plan
-        # is: a white corridor bounded by a heavy kerb line, which separates the street
-        # from the parcel ground without inventing a colour the plotter cannot render.
-        g_casing = dwg.g(id="ROAD_CASING", fill="#FFFFFF", stroke="#000000", stroke_width=0.30, fill_rule="evenodd")
-        casings = [poly for poly in flatten_polygons(road_surface) if poly.area >= 1.0]
-        for poly in casings:
-            g_casing.add(dwg.path(d=svg_path_polygon(poly, placement)))
-        if casings:
-            map_group.add(g_casing)
+
+    # --- 1. site texture: kerbs, walls, water -----------------------------
     if poi_lines:
-        # Kerb/wall/water linework: thin, so the eye reads it as context behind the
-        # buildings rather than as another building edge.
-        g_poi = dwg.g(id="CONTEXT_LINES", fill="none", stroke="#000000", stroke_width=0.13, stroke_linecap="butt")
+        g_poi = dwg.g(
+            id="CONTEXT_LINES",
+            fill="none",
+            stroke="#000000",
+            stroke_width=stroke_mm("CONTEXT_LINES"),
+            stroke_linecap="butt",
+        )
         for line in poi_lines:
             d = svg_path_line(line, placement)
             if d:
                 g_poi.add(dwg.path(d=d))
         map_group.add(g_poi)
 
-    g_roads = dwg.g(
-        id="ROADS", fill="none", stroke="#000000", stroke_width="0.35", stroke_linecap="butt", stroke_linejoin="round"
-    )
-    p = svg_path_line(road_boundaries, placement)
-    if p:
-        g_roads.add(dwg.path(d=p))
-    map_group.add(g_roads)
+    # --- 2. parcel / landuse boundaries -----------------------------------
     g_parcels = dwg.g(
-        id="PARCELS", fill="none", stroke="#000000", stroke_width="0.18", stroke_linecap="butt", stroke_linejoin="miter"
+        id="PARCELS",
+        fill="none",
+        stroke="#000000",
+        stroke_width=stroke_mm("PARCELS"),
+        stroke_linecap="butt",
+        stroke_linejoin="miter",
     )
     for line in parcels:
         d = svg_path_line(line, placement)
         if d:
             g_parcels.add(dwg.path(d=d))
     map_group.add(g_parcels)
-    # Building poche. The rendered sheet used to show a diagonal line pattern because
-    # the SVG drew the clipped hatch *segments*; the DXF said SOLID, so the PDF and the
-    # CAD file described different drawings. The fill is now stated directly: solid
-    # black, drawn under the wall line so the perimeter stays crisp.
+
+    # --- 3. roads: filled surface, then kerb edge -------------------------
+    if road_surface is not None:
+        # Strictly monochrome sheet, so the roadway cannot be a grey tone: it is drawn
+        # the way a voirie plan is, a white corridor bounded by a heavy kerb line.
+        g_casing = dwg.g(
+            id="ROAD_CASING",
+            fill="#FFFFFF",
+            stroke="#000000",
+            stroke_width=stroke_mm("ROAD_CASING"),
+            fill_rule="evenodd",
+        )
+        casings = [poly for poly in flatten_polygons(road_surface) if poly.area >= 1.0]
+        for poly in casings:
+            g_casing.add(dwg.path(d=svg_path_polygon(poly, placement)))
+        if casings:
+            map_group.add(g_casing)
+    g_roads = dwg.g(
+        id="ROADS",
+        fill="none",
+        stroke="#000000",
+        stroke_width=stroke_mm("ROADS"),
+        stroke_linecap="butt",
+        stroke_linejoin="round",
+    )
+    p = svg_path_line(road_boundaries, placement)
+    if p:
+        g_roads.add(dwg.path(d=p))
+        map_group.add(g_roads)
+
+    # --- 4. building poche, above every ground line ------------------------
+    # Solid fill drawn over the road and parcel linework, so a road edge that crosses a
+    # footprint is masked by the building rather than grazing its corner.
     fill_colour = "#000000" if hatched else "#FFFFFF"
     g_build = dwg.g(
         id="BUILDINGS",
         fill=fill_colour,
         stroke="#000000",
-        stroke_width="0.50",
+        stroke_width=stroke_mm("BUILDINGS"),
         fill_rule="evenodd",
         stroke_linejoin="miter",
     )
@@ -864,23 +917,30 @@ def write_svg(
         # Same geometry again with no fill, so shared walls and courtyard rings keep a
         # clean outline where two black footprints abut and would merge into one shape.
         g_outer = dwg.g(
-            id="BUILDING_WALLS_OVER_HATCH", fill="none", stroke="#000000", stroke_width="0.50", stroke_linejoin="miter"
+            id="BUILDING_WALLS_OVER_HATCH",
+            fill="none",
+            stroke="#000000",
+            stroke_width=stroke_mm("BUILDINGS"),
+            stroke_linejoin="miter",
         )
         for poly in buildings:
             g_outer.add(dwg.path(d=svg_path_polygon(poly, placement)))
         map_group.add(g_outer)
+
+    # --- 5. site boundary, above the fabric -------------------------------
     if not site.is_empty:
         g_site = dwg.g(
             id="SITE_BOUNDARY",
             fill="none",
             stroke="#000000",
-            stroke_width="0.60",
+            stroke_width=stroke_mm("SITE_BOUNDARY"),
             stroke_dasharray="4 2",
             stroke_linecap="butt",
             stroke_linejoin="round",
         )
         g_site.add(dwg.path(d=svg_path_polygon(site, placement)))
         map_group.add(g_site)
+
     # The DXF has always carried a cartouche, north arrow and UTM grid in its
     # paperspace layout, but the rendered sheet showed the drawing alone and the
     # reserved title-block band came back blank. Compositing the same annotation
@@ -893,7 +953,9 @@ def write_svg(
         if viewport_m is not None:
             minx, miny, maxx, maxy = viewport_m
             viewport = (minx, miny, maxx, maxy)
-        add_sheet_annotations(dwg, placement, metadata, pad_m=pad_m, viewport_m=viewport)
+        # with_grid=False: the backdrop pass already emitted the grid *behind* the
+        # geometry, which is the whole point of the split.
+        add_sheet_annotations(dwg, placement, metadata, pad_m=pad_m, viewport_m=viewport, with_grid=False)
     dwg.save(pretty=True)
 
 

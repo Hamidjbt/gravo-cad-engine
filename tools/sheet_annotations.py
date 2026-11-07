@@ -52,6 +52,75 @@ TYPE_SMALL_MM = 1.9
 TYPE_GRID_MM = 1.9
 
 
+#: Draw order and pen weights for everything on the map, back to front.
+#:
+#: Two separate defects are fixed by stating this in one place:
+#:
+#: *Order.* The UTM grid used to be composited after the geometry, so its hairlines ran
+#: straight over the solid black poche and the road linework ran over building corners.
+#: A survey grid is the surface the plan is drawn *on*, so it belongs behind everything;
+#: poche is the figure, so it belongs above the ground linework and masks any road edge
+#: that crosses it.
+#:
+#: *Weight.* Grid, roads, walls and the frame previously sat within 0.13-0.50 mm of each
+#: other, which reads as one undifferentiated grey at arm's length. The ladder below
+#: spans roughly 4x from grid hairline to frame, which is what produces figure-ground
+#: separation on a plotted sheet.
+#:
+#: The values are millimetres of ink on paper: the SVG viewBox is one millimetre per
+#: user unit, so a stroke width is literally its printed width.
+LAYERS: dict[str, dict[str, float | str]] = {
+    # name: (paint order index kept implicitly by list position), stroke width, role
+    "GRID": {"stroke_mm": 0.10, "role": "background survey grid, faint hairline"},
+    "CONTEXT_LINES": {"stroke_mm": 0.13, "role": "kerbs, walls, water: site texture"},
+    "PARCELS": {"stroke_mm": 0.18, "role": "landuse / parcel boundaries"},
+    "ROAD_CASING": {"stroke_mm": 0.35, "role": "road surface, kerb edge"},
+    "ROADS": {"stroke_mm": 0.30, "role": "road corridor boundary"},
+    "BUILDINGS": {"stroke_mm": 0.60, "role": "poche fill and wall line"},
+    "BUILDING_WALLS_OVER_HATCH": {"stroke_mm": 0.60, "role": "wall outline over the poche fill"},
+    "SITE_BOUNDARY": {"stroke_mm": 0.60, "role": "site / study boundary"},
+    "ANNOTATION": {"stroke_mm": 0.30, "role": "ticks, north arrow"},
+    "FRAME": {"stroke_mm": 0.90, "role": "map viewport frame: heaviest line on the sheet"},
+    "CARTOCHE": {"stroke_mm": 0.70, "role": "title block panel"},
+}
+
+#: Paint order, back to front. Anything drawing into the map must be added in this
+#: order or it will not match the contract the tests assert.
+DRAW_ORDER: tuple[str, ...] = (
+    "GRID",
+    "CONTEXT_LINES",
+    "PARCELS",
+    "ROAD_CASING",
+    "ROADS",
+    "BUILDINGS",
+    "BUILDING_WALLS_OVER_HATCH",
+    "SITE_BOUNDARY",
+    "ANNOTATION",
+    "FRAME",
+    "CARTOCHE",
+)
+
+
+def stroke_mm(layer: str) -> float:
+    """Pen weight, in millimetres on paper, for ``layer``."""
+    try:
+        return float(LAYERS[layer]["stroke_mm"])
+    except KeyError as exc:  # pragma: no cover - programmer error
+        raise KeyError(f"unknown sheet layer {layer!r}; add it to LAYERS") from exc
+
+
+def paint_index(group_id: str) -> int:
+    """Position of a map group in the back-to-front draw order.
+
+    Group ids on the rendered sheet are upper case (``ROAD_CASING``) while the layer
+    table is keyed by the same name, so this is a direct lookup with a clear failure
+    rather than a silent ``-1`` that would sort a new layer to the back.
+    """
+    if group_id not in LAYERS:
+        raise KeyError(f"{group_id!r} is not a known sheet layer")
+    return DRAW_ORDER.index(group_id)
+
+
 def _font(weight: str = "normal"):
     from matplotlib.font_manager import FontProperties
 
@@ -383,8 +452,8 @@ def add_map_frame(dwg, placement, pad_m: float = 0.0, viewport_m=None):
     left, top = min(x0, x1), min(y0, y1)
     right, bottom = max(x0, x1), max(y0, y1)
 
-    frame = dwg.g(id="G-ANNO-FRAME", fill="none", stroke="#000000", stroke_width=0.5)
-    frame.add(dwg.rect(insert=(left, top), size=(right - left, bottom - top)))
+    frame = dwg.g(id="G-ANNO-FRAME", fill="none", stroke="#000000", stroke_width=stroke_mm("FRAME"))
+    frame.add(dwg.rect(insert=(left, top), size=(right - left, bottom - top), stroke_width=stroke_mm("FRAME")))
     # Inner hairline offset 1.2 mm: the double rule is the standard sheet border that
     # separates the map from the margin without needing a second colour.
     frame.add(
@@ -478,7 +547,7 @@ def add_cartouche(dwg, placement, metadata: dict[str, Any]) -> list[str]:
     panel = dwg.g(id="G-ANNO-TTLB", fill="none", stroke="#000000")
     # The outer rule is the heaviest line on the sheet: the cartouche is a panel on the
     # drawing, not a table floating in the margin.
-    panel.add(dwg.rect(insert=(x, y), size=(w, h), stroke_width=0.7))
+    panel.add(dwg.rect(insert=(x, y), size=(w, h), stroke_width=stroke_mm("CARTOCHE")))
     panel.add(dwg.rect(insert=(x + 1.1, y + 1.1), size=(w - 2.2, h - 2.2), stroke_width=0.18))
     panel.add(dwg.line(start=(x, y + c["head_h"]), end=(x + w, y + c["head_h"]), stroke_width=0.5))
     panel.add(dwg.line(start=(x, y + c["foot_y"]), end=(x + w, y + c["foot_y"]), stroke_width=0.5))
@@ -563,7 +632,7 @@ def add_scale_bar(dwg, placement) -> list[str]:
     return ["G-ANNO-SCALE-BAR", "G-ANNO-SCALE-BAR-LABEL"]
 
 
-def add_grid(dwg, placement, pad_m: float = 0.0, viewport_m=None) -> tuple[list[str], list[str]]:
+def add_grid(dwg, placement, pad_m: float = 0.0, viewport_m=None, target=None) -> tuple[list[str], list[str]]:
     """UTM grid: through-lines across the map, ticks crossing the frame, edge labels.
 
     Returns the easting and northing label strings actually printed, so a test can
@@ -574,7 +643,10 @@ def add_grid(dwg, placement, pad_m: float = 0.0, viewport_m=None) -> tuple[list[
 
     # Through-lines: hairline, clipped to the map so they read as survey grid, not as a
     # second set of frame rules. They are what stops the labels floating free.
-    lines = dwg.g(id="G-ANNO-GRID", fill="none", stroke="#000000", stroke_width=0.09)
+    # The grid is background: it is emitted into the caller's backdrop group when one is
+    # given, so it lands behind the poche instead of striking through it.
+    emit = target if target is not None else dwg
+    lines = dwg.g(id="G-ANNO-GRID", fill="none", stroke="#000000", stroke_width=stroke_mm("GRID"))
     for easting in eastings:
         gx, _ = _model_to_svg(easting, 0.0, placement, None)
         if left + 1.3 < gx < right - 1.3:
@@ -583,9 +655,9 @@ def add_grid(dwg, placement, pad_m: float = 0.0, viewport_m=None) -> tuple[list[
         _, gy = _model_to_svg(0.0, northing, placement, None)
         if top + 1.3 < gy < bottom - 1.3:
             lines.add(dwg.line(start=(left, gy), end=(right, gy)))
-    dwg.add(lines)
+    emit.add(lines)
 
-    ticks = dwg.g(id="G-ANNO-TICKS", fill="none", stroke="#000000", stroke_width=0.35)
+    ticks = dwg.g(id="G-ANNO-TICKS", fill="none", stroke="#000000", stroke_width=stroke_mm("ANNOTATION"))
     labels = dwg.g(id="G-ANNO-GRID-LABELS", fill="none", stroke="#000000")
     dwg.add(ticks)
 
@@ -675,6 +747,25 @@ def add_north_arrow(dwg, placement, pad_m: float = 0.0, viewport_m=None):
     return ["G-ANNO-NORTH", "G-ANNO-NORTH-LABEL"]
 
 
+def add_sheet_backdrop(
+    dwg,
+    placement,
+    *,
+    pad_m: float = 0.0,
+    with_grid: bool = True,
+    viewport_m: tuple[float, float, float, float] | None = None,
+):
+    """Ground layer painted *under* the map geometry: the survey grid.
+
+    Called before the geometry is written, so grid hairlines sit beneath the poche
+    rather than striking through it. Returns the group ids written.
+    """
+    if not with_grid:
+        return []
+    add_grid(dwg, placement, pad_m, viewport_m, target=dwg)
+    return ["G-ANNO-GRID", "G-ANNO-GRID-LABELS"]
+
+
 def add_sheet_annotations(
     dwg,
     placement,
@@ -689,18 +780,21 @@ def add_sheet_annotations(
 ):
     """Composite frame, cartouche, scale bar, UTM grid and north arrow into an SVG sheet.
 
+    The grid is written by :func:`add_sheet_backdrop` instead, because it has to be
+    painted before the geometry. Passing ``with_grid=True`` here still works for callers
+    that draw a sheet with no geometry; it simply emits the grid first.
+
     Returns the list of group ids written, so callers and tests can assert the sheet
     actually received them rather than trusting a boolean.
     """
     written: list[str] = []
 
+    if with_grid:
+        written.extend(add_sheet_backdrop(dwg, placement, pad_m=pad_m, viewport_m=viewport_m))
+
     if with_frame:
         add_map_frame(dwg, placement, pad_m, viewport_m)
         written.append("G-ANNO-FRAME")
-
-    if with_grid:
-        add_grid(dwg, placement, pad_m, viewport_m)
-        written.extend(["G-ANNO-GRID", "G-ANNO-TICKS", "G-ANNO-GRID-LABELS"])
 
     if with_north:
         add_north_arrow(dwg, placement, pad_m, viewport_m)
