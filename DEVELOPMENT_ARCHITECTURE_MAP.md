@@ -225,9 +225,11 @@ persistent-quota ceiling, "render it, then delete it" is a workaround that quiet
 larger the sheet, the more likely the write itself fails. `tools/egress_manager.py` removes artifact
 *retention* from the monitored tree instead of removing resolution from the renderer.
 
-- **`ArtifactEgress`** is a context manager that owns a private buffer under
-  `/var/tmp/gravo_egress_buffer/<run_id>/`. It refuses to construct if the buffer root resolves inside
-  `/home/user`, so the invariant cannot be broken by configuration.
+- **`ArtifactEgress`** is a context manager that owns a private buffer under the system scratch
+  directory (`/var/tmp/gravo_egress_buffer/<run_id>/` where `/var/tmp` is writable, else the system
+  temp directory). It refuses to construct if the buffer root resolves inside the monitored tree — the
+  tree named by `GRAVO_WORKSPACE`, else the user's home directory — so the invariant cannot be broken
+  by configuration.
 - **Registration is path-checked.** `register()` rejects any artifact that does not resolve inside the
   buffer, so a stray write elsewhere is an error rather than a silent leak.
 - **Flush verifies bytes.** Each artifact is streamed to a sink, and the remote byte count must equal the

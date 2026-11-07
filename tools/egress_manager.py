@@ -1,15 +1,17 @@
 """Artifact egress: decouple heavy artifact generation from the monitored workspace.
 
-The monitored persistent tree (``/home/user``) is a quota-constrained resource. This
-module makes artifact *generation* independent of artifact *retention*:
+The monitored persistent tree is a quota-constrained resource. This module makes
+artifact *generation* independent of artifact *retention*:
 
-* every heavy output is produced inside a bounded scratch buffer rooted at
-  ``/var/tmp/gravo_egress_buffer/`` — never in the monitored tree;
+* every heavy output is produced inside a bounded scratch buffer under the system
+  temp directory — never in the monitored tree;
 * on context exit the buffer is streamed to a remote sink and then purged,
   on both the success and the exception path;
-The monitored tree defaults to ``/home/user`` and can be redirected with the
-``GRAVO_WORKSPACE`` environment variable, so the same code runs unchanged on a
-developer sandbox and on a CI runner that has no ``/home/user``.
+
+The monitored tree is resolved at call time, in this order: the ``GRAVO_WORKSPACE``
+environment variable, else :data:`DEFAULT_MONITORED_ROOT`, which is derived from the
+running user's home directory. No absolute host path is assumed, so the same code
+runs unchanged on a developer sandbox and on a CI runner.
 
 * the single durable artefact left behind is ``<run_id>_receipt.json`` — a
   lightweight, immutable manifest carrying remote URIs, byte counts and SHA256
@@ -25,6 +27,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import uuid
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -32,17 +35,40 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-#: Scratch space for in-flight artifacts. Deliberately outside the monitored tree.
-DEFAULT_BUFFER_ROOT = Path("/var/tmp/gravo_egress_buffer")
-
 #: Environment variable naming the monitored tree, so the engine is not hard-wired
-#: to one host layout. CI runners have no ``/home/user``; they must point this at a
-#: throwaway directory instead.
+#: to one host layout. CI runners point this at throwaway space.
 WORKSPACE_ENV_VAR = "GRAVO_WORKSPACE"
+
+
+def _default_scratch_root() -> Path:
+    """Scratch space for in-flight artifacts, sized for the host.
+
+    ``/var/tmp`` is preferred where it exists and is writable, because it survives
+    reboots and is not the small RAM-backed ``/tmp``; several sandboxes mount
+    ``/tmp`` as a bounded tmpfs. Elsewhere the system temp directory is used.
+    """
+    candidate = Path("/var/tmp")
+    if candidate.is_dir() and os.access(candidate, os.W_OK):
+        return candidate / "gravo_egress_buffer"
+    return Path(tempfile.gettempdir()) / "gravo_egress_buffer"
+
+
+def _default_monitored_root() -> Path:
+    """The quota-constrained persistent tree for this host.
+
+    Derived from the home directory rather than hard-coded, so the engine behaves
+    correctly on a sandbox, a CI runner (``$HOME`` is ``/home/runner`` there) and any
+    other host. ``GRAVO_WORKSPACE`` overrides it.
+    """
+    return Path.home()
+
+
+#: Scratch space for in-flight artifacts. Deliberately outside the monitored tree.
+DEFAULT_BUFFER_ROOT = _default_scratch_root()
 
 #: Default location of the quota-constrained persistent tree when the environment
 #: does not override it.
-DEFAULT_MONITORED_ROOT = Path("/home/user")
+DEFAULT_MONITORED_ROOT = _default_monitored_root()
 
 
 def monitored_root_from_env() -> Path:
@@ -429,7 +455,9 @@ def resolve_sink(
         )
     if destination == "local":
         if local_root is None:
-            raise EgressError("local destination requires a directory outside the monitored tree")
+            raise EgressError(
+                "local destination requires an explicit --egress-local-root directory outside the monitored tree"
+            )
         return LocalDirectorySink(local_root)
     if destination == "null":
         return NullSink()
@@ -488,7 +516,7 @@ class ArtifactEgress:
             shutil.rmtree(self._buffer)
         # Validate before creating. Creating first let ``mkdir(parents=True)`` try to
         # build the monitored tree itself on hosts where it does not exist (a CI
-        # runner has no /home/user), raising PermissionError *before* the guard that
+        # runner has no such tree), raising PermissionError *before* the guard that
         # was supposed to reject the placement.
         self._assert_outside_monitored(self._buffer)
         self._buffer.mkdir(parents=True, exist_ok=False)

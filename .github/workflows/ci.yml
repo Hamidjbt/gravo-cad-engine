@@ -20,10 +20,9 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
   # Deterministic iteration order, independent of the runner's hash seed.
   PYTHONHASHSEED: "0"
+  # Scratch space. /tmp is ordinary disk on a runner; the sandbox keeps /var/tmp
+  # (see the Makefile) because there /tmp is a bounded tmpfs.
   TMP_ROOT: /tmp
-  # The monitored tree does not exist on a runner. Point it at throwaway space so
-  # egress footprint accounting is meaningful instead of absent.
-  GRAVO_WORKSPACE: ${{ runner.temp }}/workspace
 
 jobs:
   verify:
@@ -40,11 +39,19 @@ jobs:
       - name: Show toolchain
         run: python --version && git --version
 
+      # The monitored tree does not exist on a runner. Point footprint accounting
+      # at throwaway space. This must stay at step level: the `runner` context is
+      # not available in a workflow-level `env:` block, and referencing it there
+      # makes the whole workflow invalid ("Unrecognized named-value: 'runner'").
       - name: Prepare the monitored workspace
+        env:
+          GRAVO_WORKSPACE: ${{ runner.temp }}/gravo-workspace
         run: mkdir -p "$GRAVO_WORKSPACE"
 
       # Tests run before lint, matching the required local order.
       - name: make test
+        env:
+          GRAVO_WORKSPACE: ${{ runner.temp }}/gravo-workspace
         run: make test
 
       - name: make lint

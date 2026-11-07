@@ -123,10 +123,11 @@ def test_buffer_is_created_under_var_tmp_and_purged(tmp_path):
 def test_buffer_inside_monitored_tree_is_refused(tmp_path, monkeypatch):
     """A buffer placed inside the monitored tree must be rejected.
 
-    The monitored tree is redirected with GRAVO_WORKSPACE rather than hard-coding
-    ``/home/user``: a CI runner has no such path, and ``mkdir(parents=True)`` would
-    raise PermissionError while trying to create it instead of reporting the real
-    problem. See test_guard_runs_before_the_buffer_is_created.
+    The monitored tree is redirected with GRAVO_WORKSPACE to a temporary directory
+    rather than naming any host path: a CI runner's home is not a writable tree the
+    job may create, and ``mkdir(parents=True)`` against a missing one raises
+    PermissionError instead of reporting the real problem.
+    See test_guard_runs_before_the_buffer_is_created.
     """
     monkeypatch.setenv("GRAVO_WORKSPACE", str(tmp_path))
     egress = ArtifactEgress(
@@ -144,9 +145,9 @@ def test_guard_runs_before_the_buffer_is_created(tmp_path, monkeypatch):
 
     Regression: ``mkdir(parents=True, exist_ok=False)`` used to run first, so a
     buffer inside a *non-existent* monitored root tried to create that root. On a
-    GitHub runner (no ``/home/user``) this surfaced as
-    ``PermissionError: [Errno 13] Permission denied: '/home/user'`` instead of the
-    EgressError the contract promises — passing on the sandbox, failing in CI.
+    GitHub runner this surfaced as ``PermissionError: [Errno 13] Permission denied``
+    on the monitored path instead of the EgressError the contract promises — passing
+    on a developer sandbox, failing in CI.
     """
     absent_root = tmp_path / "no-such-workspace"
     monkeypatch.setenv("GRAVO_WORKSPACE", str(absent_root))
