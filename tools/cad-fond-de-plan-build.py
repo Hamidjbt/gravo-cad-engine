@@ -64,7 +64,7 @@ from sheet_annotations import add_sheet_annotations
 from urban_topology import build_road_graph, reconcile_parcel_frontages, road_corridor_from_graph, snap_shared_walls
 
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-ENGINE_VERSION = "1.12.0"
+ENGINE_VERSION = "1.13.0"
 DEFAULT_REPORT_DETAIL = "full"
 
 # Architectural trace digitized from the supplied image after matching Microsoft building
@@ -611,7 +611,10 @@ def road_casements(
     The default 3-tuple return is kept for existing callers. Set ``return_graph`` to
     additionally receive the graph for DXF centerline/block annotation output.
     """
-    local_cut = Point(cx, cy).buffer(82.0)
+    # The inner block is only cut out when an aerial trace exists to replace it. With no
+    # image the cut removed every road and landuse boundary within 82 m of the centre and
+    # put nothing back, which is exactly why the middle of the plan read as blank paper.
+    local_cut = Point(cx, cy).buffer(82.0) if manual_roads else Polygon()
     segments = []
     osm_count = manual_count = 0
     source_crs = osm.crs.to_epsg() if osm.crs is not None else None
@@ -621,7 +624,7 @@ def road_casements(
         projected = transform(to_utm.transform, geom) if source_crs == 4326 else geom
         # OSM centerlines are inaccurate in the locally imaged block; use the explicit
         # aerial trace in the inner 82 m, retain OSM context outside it.
-        pieces = projected.difference(local_cut)
+        pieces = projected.difference(local_cut) if not local_cut.is_empty else projected
         metadata = {k: tags.get(k) for k in ("highway", "layer", "bridge", "tunnel", "name") if tags.get(k) is not None}
         metadata["source"] = "OSM"
         for line in flatten_lines(pieces):
@@ -648,7 +651,7 @@ def extract_parcels(
     osm: gpd.GeoDataFrame, to_utm: Transformer, study_circle: Polygon, manual: list[LineString], cx: float, cy: float
 ) -> list[LineString]:
     lines = list(manual)
-    local_cut = Point(cx, cy).buffer(82.0)
+    local_cut = Point(cx, cy).buffer(82.0) if manual else Polygon()
     for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
         if geom is None:
             continue
@@ -656,13 +659,50 @@ def extract_parcels(
             projected = transform(to_utm.transform, geom) if osm.crs.to_epsg() == 4326 else geom
             if projected.geom_type in ("Polygon", "MultiPolygon"):
                 projected = projected.boundary
-            clipped = projected.intersection(study_circle).difference(local_cut)
+            clipped = projected.intersection(study_circle)
+            if not local_cut.is_empty:
+                clipped = clipped.difference(local_cut)
             lines.extend(flatten_lines(clipped))
     clean = []
     for line in lines:
         if line.length > 2.0:
             clean.append(line)
     return clean
+
+
+#: OSM tags that carry site context as linework. Footways and services give the street
+#: grain; barriers and water give the block edges; rail is the strongest urban cue of all
+#: and is almost never present as a polygon.
+_CONTEXT_TAG_KEYS = ("highway", "barrier", "waterway", "railway", "natural", "man_made", "power")
+
+
+def extract_context_lines(osm: gpd.GeoDataFrame, to_utm: Transformer, study_area) -> list[LineString]:
+    """Linework for everything that gives the plan urban context.
+
+    Deliberately excludes features already drawn: buildings become poché, highways become
+    the road casement, and landuse boundaries become parcel lines. What is left -- footways,
+    service alleys, city walls, water, rail -- is exactly the texture a site plan needs to
+    stop looking like footprints on blank paper.
+    """
+    source_crs = osm.crs.to_epsg() if osm.crs is not None else None
+    lines: list[LineString] = []
+    for geom, tags in zip(osm.geometry, osm.to_dict("records"), strict=True):
+        if geom is None or geom.is_empty:
+            continue
+        if not any(tags.get(key) for key in _CONTEXT_TAG_KEYS):
+            continue
+        if tags.get("highway"):
+            continue  # already carried by the road casement
+        if tags.get("building") or tags.get("building:part"):
+            continue
+        projected = transform(to_utm.transform, geom) if source_crs == 4326 else geom
+        clipped = projected.intersection(study_area)
+        if clipped.is_empty:
+            continue
+        for part in flatten_lines(clipped):
+            if part.length > 3.0:
+                lines.append(part)
+    return lines
 
 
 def line_hatches(poly: Polygon, spacing_m: float) -> list[LineString]:
@@ -737,6 +777,9 @@ def write_svg(
     hatched: bool,
     metadata: dict | None = None,
     pad_m: float = 0.0,
+    road_surface=None,
+    poi_lines: list | None = None,
+    viewport_m=None,
 ):
     """Write one true-to-scale sheet.
 
@@ -761,6 +804,31 @@ def write_svg(
     map_group = dwg.g()
     map_group.attribs["clip-path"] = "url(#USABLE_AREA)"
     dwg.add(map_group)
+    # Road hierarchy, drawn back-to-front: the casing is the road surface, the centreline
+    # is the kerb boundary. Filling the casement is what gives the plan an urban context
+    # instead of buildings floating on blank paper -- an unfilled outline of a road
+    # network at 1:1000 reads as stray lines, not as streets.
+    if road_surface is not None:
+        # The sheet contract is strictly monochrome (fill must be #000000, #FFFFFF or
+        # none), so the roadway cannot be a grey tone. It is drawn the way a voirie plan
+        # is: a white corridor bounded by a heavy kerb line, which separates the street
+        # from the parcel ground without inventing a colour the plotter cannot render.
+        g_casing = dwg.g(id="ROAD_CASING", fill="#FFFFFF", stroke="#000000", stroke_width=0.30, fill_rule="evenodd")
+        casings = [poly for poly in flatten_polygons(road_surface) if poly.area >= 1.0]
+        for poly in casings:
+            g_casing.add(dwg.path(d=svg_path_polygon(poly, placement)))
+        if casings:
+            map_group.add(g_casing)
+    if poi_lines:
+        # Kerb/wall/water linework: thin, so the eye reads it as context behind the
+        # buildings rather than as another building edge.
+        g_poi = dwg.g(id="CONTEXT_LINES", fill="none", stroke="#000000", stroke_width=0.13, stroke_linecap="butt")
+        for line in poi_lines:
+            d = svg_path_line(line, placement)
+            if d:
+                g_poi.add(dwg.path(d=d))
+        map_group.add(g_poi)
+
     g_roads = dwg.g(
         id="ROADS", fill="none", stroke="#000000", stroke_width="0.35", stroke_linecap="butt", stroke_linejoin="round"
     )
@@ -776,9 +844,14 @@ def write_svg(
         if d:
             g_parcels.add(dwg.path(d=d))
     map_group.add(g_parcels)
+    # Building poche. The rendered sheet used to show a diagonal line pattern because
+    # the SVG drew the clipped hatch *segments*; the DXF said SOLID, so the PDF and the
+    # CAD file described different drawings. The fill is now stated directly: solid
+    # black, drawn under the wall line so the perimeter stays crisp.
+    fill_colour = "#000000" if hatched else "#FFFFFF"
     g_build = dwg.g(
         id="BUILDINGS",
-        fill="#FFFFFF",
+        fill=fill_colour,
         stroke="#000000",
         stroke_width="0.50",
         fill_rule="evenodd",
@@ -788,13 +861,8 @@ def write_svg(
         g_build.add(dwg.path(d=svg_path_polygon(poly, placement)))
     map_group.add(g_build)
     if hatched:
-        g_hatch = dwg.g(id="HATCH", fill="none", stroke="#000000", stroke_width="0.13", stroke_linecap="butt")
-        for line in hatch_geoms:
-            d = svg_path_line(line, placement)
-            if d:
-                g_hatch.add(dwg.path(d=d))
-        map_group.add(g_hatch)
-        # Redraw walls over the clipped hatch to preserve a crisp architectural perimeter.
+        # Same geometry again with no fill, so shared walls and courtyard rings keep a
+        # clean outline where two black footprints abut and would merge into one shape.
         g_outer = dwg.g(
             id="BUILDING_WALLS_OVER_HATCH", fill="none", stroke="#000000", stroke_width="0.50", stroke_linejoin="miter"
         )
@@ -818,7 +886,14 @@ def write_svg(
     # reserved title-block band came back blank. Compositing the same annotation
     # here means a plotted PDF needs no AutoCAD round-trip to acquire a title block.
     if metadata is not None:
-        add_sheet_annotations(dwg, placement, metadata, pad_m=pad_m)
+        # The study area is a rectangle, so it has to be passed explicitly: pad_m alone
+        # describes a square and the frame would be drawn round a viewport that is not
+        # the one the geometry was clipped to.
+        viewport = None
+        if viewport_m is not None:
+            minx, miny, maxx, maxy = viewport_m
+            viewport = (minx, miny, maxx, maxy)
+        add_sheet_annotations(dwg, placement, metadata, pad_m=pad_m, viewport_m=viewport)
     dwg.save(pretty=True)
 
 
@@ -1013,6 +1088,39 @@ def write_dxf(
         for sheet_layout in layouts:
             add_paperspace_viewport(doc, sheet_layout, metadata)
     save_dxf_deterministic(doc, path)
+
+
+def study_area_rect(center, radius: float, args=None):
+    """Study viewport: a rectangle matching, as closely as possible, the paper's shape.
+
+    The previous viewport was ``Point.buffer(radius)``. Every footprint, road and parcel
+    was then clipped by that circle, so the plan showed an arc through the building stock
+    and four empty corners -- a raw mask edge rather than a sheet frame.
+
+    The user's radius is a *half-extent*, so the study area must not shrink just because
+    the paper is not square: a radius that filled the page height before must still fill
+    it. The rectangle is therefore laid out so the lon axis grows to the page aspect and
+    the lat axis stays at the radius, giving ``radius x (radius / aspect)`` metres around
+    the centre. At 1:1000 on A3 the page shows 400 x 227 m, so a 113.5 m radius becomes
+    200 x 113.5 m.
+    """
+    cx, cy = center.x, center.y
+    aspect = 1.0
+    if args is not None and getattr(args, "layout_sheet", None):
+        from layout_engine import TITLEBLOCK_MM, page_size
+
+        pw, ph = page_size(args.layout_sheet, getattr(args, "orientation", "landscape"))
+        # The usable band, not the full page: the title block eats 50 mm of height, and
+        # the viewport is drawn into the band, so the band is what it has to match.
+        margin = 10.0
+        aspect = (pw - 2 * margin) / (ph - 2 * margin - TITLEBLOCK_MM[1])
+    half_h = radius
+    half_w = radius * aspect if aspect > 1.0 else radius
+    if aspect < 1.0:
+        half_h = radius / aspect
+    from shapely.geometry import box as _box
+
+    return _box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
 
 def resolve_sheet_placement(args, radius: float, center_utm: tuple[float, float]):
@@ -1378,7 +1486,12 @@ def _build_core(args, out_dir: Path) -> dict:
     cx, cy = to_utm.transform(lon, lat)
     center = Point(cx, cy)
     radius = float(args.radius)
-    study_circle = center.buffer(radius, resolution=96)
+    # The study area is a rectangle whose aspect ratio matches the page, not a circle.
+    # A circular clip cut every footprint along an arc and left the corners of the plan
+    # empty: the drawing looked buffed off rather than framed. A rectangle fills the
+    # declared viewport edge to edge and its boundary is the sheet frame, so nothing is
+    # cut except by the paper itself.
+    study_circle = study_area_rect(center, radius, args)
     image_path = Path(args.image).expanduser() if args.image else None
     if image_path and not image_path.exists():
         raise FileNotFoundError(f"reference image not found: {image_path}")
@@ -1492,6 +1605,10 @@ def _build_core(args, out_dir: Path) -> dict:
     road_boundaries = road_casement.boundary if not road_casement.is_empty else GeometryCollection()
     road_centerlines = [data["geometry"] for _, _, _, data in road_graph.edges(keys=True, data=True)]
     parcels = extract_parcels(osm, to_utm, study_circle, manual_parcels, cx, cy)
+    # Context linework: footways, walls, water and rail that neither the building nor the
+    # parcel pass consumes. Without it a sheet shows footprints on blank paper; a site
+    # plan has to show what the buildings sit among.
+    context_lines = extract_context_lines(osm, to_utm, study_circle)
     parcels, frontage_snaps = reconcile_parcel_frontages(parcels, road_casement, tolerance_m=0.35)
 
     # D5: the printed sheet is resolved through the ISO 216 layout engine, never a
@@ -1524,6 +1641,9 @@ def _build_core(args, out_dir: Path) -> dict:
         False,
         metadata=sheet_metadata,
         pad_m=radius,
+        road_surface=road_casement,
+        poi_lines=context_lines,
+        viewport_m=tuple(study_circle.bounds),
     )
     write_svg(
         hatched,
@@ -1536,6 +1656,9 @@ def _build_core(args, out_dir: Path) -> dict:
         True,
         metadata=sheet_metadata,
         pad_m=radius,
+        road_surface=road_casement,
+        poi_lines=context_lines,
+        viewport_m=tuple(study_circle.bounds),
     )
     layout_bounds_m = (
         tuple(site.bounds)

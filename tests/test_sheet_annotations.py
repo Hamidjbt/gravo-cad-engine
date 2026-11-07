@@ -157,7 +157,9 @@ def test_all_annotation_groups_are_written():
     placement = _placement()
     _, written = _draw(placement)
     assert set(written) == {
+        "G-ANNO-FRAME",
         "G-ANNO-GRID",
+        "G-ANNO-TICKS",
         "G-ANNO-GRID-LABELS",
         "G-ANNO-NORTH",
         "G-ANNO-NORTH-LABEL",
@@ -170,7 +172,7 @@ def test_all_annotation_groups_are_written():
 def test_each_layer_can_be_switched_off():
     """Callers must be able to emit a bare map; the hollow variant relies on it."""
     placement = _placement()
-    _, written = _draw(placement, with_grid=False, with_north=False, with_cartouche=False)
+    _, written = _draw(placement, with_grid=False, with_north=False, with_cartouche=False, with_frame=False)
     assert written == []
 
 
@@ -323,3 +325,129 @@ def test_svg_grid_names_the_same_utm_values_as_the_dxf_paperspace():
     svg_labels = {f"E {e:.0f}" for e in eastings} | {f"N {n:.0f}" for n in northings}
 
     assert svg_labels == dxf_labels
+
+
+# ---------------------------------------------------------------------------
+# v1.13.0 -- the four review corrections
+# ---------------------------------------------------------------------------
+
+
+def test_building_poche_is_solid_black_not_a_line_pattern(tmp_path):
+    """Poiché must be a solid fill.
+
+    The sheet previously drew the clipped hatch *segments* as stroked lines, which plots
+    as a diagonal line pattern, while the DXF hatch said SOLID -- the PDF and the CAD
+    file described different drawings. This asserts the fill attribute itself, because a
+    line pattern can look plausible in a thumbnail and only betrays itself on paper.
+    """
+    import importlib
+
+    build = importlib.import_module("cad-fond-de-plan-build")
+    from shapely.geometry import Polygon
+
+    placement = _placement()
+    square = Polygon(
+        [
+            (placement.content_m[0] + 5, placement.content_m[1] + 5),
+            (placement.content_m[0] + 15, placement.content_m[1] + 5),
+            (placement.content_m[0] + 15, placement.content_m[1] + 15),
+            (placement.content_m[0] + 5, placement.content_m[1] + 15),
+        ]
+    )
+    out = tmp_path / "solid.svg"
+    build.write_svg(out, [square], None, [], Polygon(), [], placement, True, metadata=None)
+    root = ET.parse(out).getroot()
+    buildings = [g for g in root.iter() if g.attrib.get("id") == "BUILDINGS"]
+    assert buildings, "no BUILDINGS group"
+    assert buildings[0].attrib["fill"] == "#000000"
+    # And no stroked hatch linework is emitted alongside it.
+    assert not [g for g in root.iter() if g.attrib.get("id") == "HATCH"]
+
+
+def test_viewport_frame_matches_the_drawn_extent_not_the_radius(tmp_path):
+    """The frame must be the viewport the geometry was clipped to.
+
+    A rectangular study area passed to the annotations as a scalar pad came back square,
+    so a 400 mm wide band got a 227 mm frame drawn in the middle of it. This asserts the
+    frame rectangle against the viewport rectangle, in millimetres, end to end.
+    """
+    placement = _placement()
+    # A viewport strictly smaller than the page, so the page clamp cannot mask a
+    # mis-shaped frame: 300 x 200 m must come back as 300 x 200 mm at 1:1000.
+    cx, cy = placement.content_center_m
+    viewport = (cx - 150.0, cy - 100.0, cx + 150.0, cy + 100.0)
+    dwg, _ = _draw(placement, viewport_m=viewport)
+    root = ET.fromstring(dwg.tostring())
+    frame = [g for g in root.iter() if g.attrib.get("id") == "G-ANNO-FRAME"][0]
+    rect = [c for c in frame if c.tag.rsplit("}", 1)[-1] == "rect"][0]
+    width = float(rect.attrib["width"])
+    height = float(rect.attrib["height"])
+    assert width == pytest.approx(300.0 * placement.mm_per_m, abs=0.01)
+    assert height == pytest.approx(200.0 * placement.mm_per_m, abs=0.01)
+    # The square-viewport regression: passing this rectangle through the scalar pad gave
+    # 200 x 200 mm -- the width was clamped to the shortest axis.
+    assert width > height
+
+
+def test_grid_labels_are_attached_to_the_frame_by_ticks():
+    """Every printed coordinate needs a tick to belong to.
+
+    Labels floating in the margin are decoration. This asserts one tick per label on the
+    same axis, so removing the tick layer fails rather than silently shipping again.
+    """
+    placement = _placement()
+    dwg, _ = _draw(placement)
+    root = ET.fromstring(dwg.tostring())
+    ticks = [g for g in root.iter() if g.attrib.get("id") == "G-ANNO-TICKS"][0]
+    lines = list(ticks)
+    # Four eastings and two northings carry two ticks each (top+bottom, left+right).
+    assert len(lines) == 12
+    frame = [g for g in root.iter() if g.attrib.get("id") == "G-ANNO-FRAME"][0]
+    frect = [c for c in frame if c.tag.rsplit("}", 1)[-1] == "rect"][0]
+    left, top = float(frect.attrib["x"]), float(frect.attrib["y"])
+    right = left + float(frect.attrib["width"])
+    bottom = top + float(frect.attrib["height"])
+    for line in lines:
+        x1, y1 = float(line.attrib["x1"]), float(line.attrib["y1"])
+        x2, y2 = float(line.attrib["x2"]), float(line.attrib["y2"])
+        # Each tick starts on a frame edge and runs inward, never outside the frame.
+        on_edge = (
+            (abs(y1 - top) < 1e-6 and abs(y2 - top) < 3.01)  # top edge, downward
+            or (abs(y1 - bottom) < 1e-6 and abs(y2 - bottom) < 3.01)  # bottom edge, upward
+            or (abs(x1 - left) < 1e-6 and abs(x2 - left) < 3.01)
+            or (abs(x1 - right) < 1e-6 and abs(x2 - right) < 3.01)
+        )
+        assert on_edge, f"tick {x1},{y1}->{x2},{y2} is not on a frame edge"
+        assert top - 1e-6 <= min(y1, y2) and max(y1, y2) <= bottom + 1e-6
+        assert left - 1e-6 <= min(x1, x2) and max(x1, x2) <= right + 1e-6
+
+
+def test_cartouche_is_a_framed_panel_with_labelled_fields():
+    """The title block must read as an architectural cartouche, not a bare text table.
+
+    Asserts the structure a reviewer checks for: a double outer rule, band rules that
+    span the full panel width, an identity band carrying both the drawing name and its
+    subtitle, and a labelled field row carrying the scale.
+    """
+    placement = _placement()
+    dwg, _ = _draw(placement)
+    root = ET.fromstring(dwg.tostring())
+    panel = [g for g in root.iter() if g.attrib.get("id") == "G-ANNO-TTLB"][0]
+    rects = [c for c in panel if c.tag.rsplit("}", 1)[-1] == "rect"]
+    assert len(rects) == 2, "cartouche needs an outer and an inner rule"
+    # Outer rule is the heaviest line in the block.
+    widths = sorted(float(r.attrib.get("stroke-width", 1)) for r in rects)
+    assert widths[0] < widths[1]
+    x, y, w, h = sa.cartouche_rect_svg(placement)
+    for r in rects:
+        assert float(r.attrib["width"]) <= w + 1e-6
+    rules = [c for c in panel if c.tag.rsplit("}", 1)[-1] == "line"]
+    assert rules
+    for rule in rules:
+        # Band rules must span the panel, or the block reads as an open table.
+        assert abs(float(rule.attrib["x1"]) - x) < 1e-6
+        assert abs(float(rule.attrib["x2"]) - (x + w)) < 1e-6
+    # The identity band carries the title in tracked glyphs: many short paths, not one.
+    glyph_paths = [p for p in root.iter() if p.tag.rsplit("}", 1)[-1] == "path"]
+    short = [p for p in glyph_paths if len(p.attrib.get("d", "")) < 400]
+    assert len(short) > 10

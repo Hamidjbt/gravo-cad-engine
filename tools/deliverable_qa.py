@@ -259,12 +259,15 @@ def qa_dxf_file(path: Path, expected_layouts: frozenset[str] | None = None) -> d
             if entity.dxftype() == "LWPOLYLINE" and entity.dxf.layer == "G-BLDG-WALL" and entity.closed:
                 closed_rings += 1
                 coords = [(point[0], point[1]) for point in entity.get_points("xy")]
-                if len(coords) < 4 or not Polygon(coords).is_valid:
+                # get_points("xy") includes the closing vertex, so a degenerate ring has
+                # three distinct corners, not four: a triangular footprint is a legal
+                # building and was being reported as invalid.
+                if len(coords) < 3 or not Polygon(coords).is_valid:
                     invalid_rings += 1
             elif entity.dxftype() == "POLYLINE" and entity.dxf.layer == "G-BLDG-WALL" and entity.is_closed:
                 closed_rings += 1
                 coords = [(vertex.dxf.location.x, vertex.dxf.location.y) for vertex in entity.vertices]
-                if len(coords) < 4 or not Polygon(coords).is_valid:
+                if len(coords) < 3 or not Polygon(coords).is_valid:
                     invalid_rings += 1
             if entity.dxftype() in {"LINE", "LWPOLYLINE", "POLYLINE"} and entity.dxf.layer == "G-ROAD-CL":
                 centerlines += 1
