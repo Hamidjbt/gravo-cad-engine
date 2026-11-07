@@ -30,6 +30,7 @@ from tools.egress_manager import (
     chunk_plan,
     egress_report_block,
     guess_mime,
+    monitored_root_from_env,
     resolve_sink,
     sha256_file,
     workspace_footprint,
@@ -119,15 +120,66 @@ def test_buffer_is_created_under_var_tmp_and_purged(tmp_path):
     assert not buffer.exists()
 
 
-def test_buffer_inside_monitored_tree_is_refused(tmp_path):
+def test_buffer_inside_monitored_tree_is_refused(tmp_path, monkeypatch):
+    """A buffer placed inside the monitored tree must be rejected.
+
+    The monitored tree is redirected with GRAVO_WORKSPACE rather than hard-coding
+    ``/home/user``: a CI runner has no such path, and ``mkdir(parents=True)`` would
+    raise PermissionError while trying to create it instead of reporting the real
+    problem. See test_guard_runs_before_the_buffer_is_created.
+    """
+    monkeypatch.setenv("GRAVO_WORKSPACE", str(tmp_path))
     egress = ArtifactEgress(
         destination="null",
         run_id="run-buffer-002",
-        buffer_root=Path("/home/user/.forbidden-egress"),
+        buffer_root=tmp_path / ".forbidden-egress",
         receipt_dir=tmp_path,
     )
     with pytest.raises(EgressError, match="monitored tree"):
         egress.__enter__()
+
+
+def test_guard_runs_before_the_buffer_is_created(tmp_path, monkeypatch):
+    """The placement guard must run before any directory is made.
+
+    Regression: ``mkdir(parents=True, exist_ok=False)`` used to run first, so a
+    buffer inside a *non-existent* monitored root tried to create that root. On a
+    GitHub runner (no ``/home/user``) this surfaced as
+    ``PermissionError: [Errno 13] Permission denied: '/home/user'`` instead of the
+    EgressError the contract promises — passing on the sandbox, failing in CI.
+    """
+    absent_root = tmp_path / "no-such-workspace"
+    monkeypatch.setenv("GRAVO_WORKSPACE", str(absent_root))
+    egress = ArtifactEgress(
+        destination="null",
+        run_id="run-buffer-003",
+        buffer_root=absent_root / "forbidden-egress",
+        receipt_dir=tmp_path,
+    )
+    with pytest.raises(EgressError, match="monitored tree"):
+        egress.__enter__()
+    # Nothing was created: neither the buffer nor the monitored root.
+    assert not absent_root.exists()
+
+
+def test_monitored_root_is_taken_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRAVO_WORKSPACE", str(tmp_path / "ws"))
+    assert monitored_root_from_env() == tmp_path / "ws"
+
+
+def test_footprint_of_an_absent_root_is_zero_not_an_error(tmp_path):
+    """Accounting a tree that does not exist contributes zero, never raises."""
+    assert workspace_footprint(tmp_path / "definitely-absent") == 0
+
+
+def test_receipt_records_the_redirected_monitored_root(tmp_path, monkeypatch):
+    """Footprint accounting and the receipt must follow the redirect."""
+    monkeypatch.setenv("GRAVO_WORKSPACE", str(tmp_path))
+    with ArtifactEgress(destination="null", run_id="run-raised-002") as egress:
+        egress.register(_payload(egress.buffer / "sheet.png", 16))
+    receipt = json.loads((tmp_path / "run-raised-002_receipt.json").read_text(encoding="utf-8"))
+    assert receipt["workspace"]["monitored_root"] == str(tmp_path)
+    assert receipt["status"] == "succeeded"
 
 
 def test_artifact_path_cannot_escape_the_buffer(tmp_path):

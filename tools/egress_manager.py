@@ -7,6 +7,10 @@ module makes artifact *generation* independent of artifact *retention*:
   ``/var/tmp/gravo_egress_buffer/`` — never in the monitored tree;
 * on context exit the buffer is streamed to a remote sink and then purged,
   on both the success and the exception path;
+The monitored tree defaults to ``/home/user`` and can be redirected with the
+``GRAVO_WORKSPACE`` environment variable, so the same code runs unchanged on a
+developer sandbox and on a CI runner that has no ``/home/user``.
+
 * the single durable artefact left behind is ``<run_id>_receipt.json`` — a
   lightweight, immutable manifest carrying remote URIs, byte counts and SHA256
   checksums that prove the payload was secured externally.
@@ -31,8 +35,29 @@ from typing import Any, Protocol
 #: Scratch space for in-flight artifacts. Deliberately outside the monitored tree.
 DEFAULT_BUFFER_ROOT = Path("/var/tmp/gravo_egress_buffer")
 
-#: The quota-constrained persistent tree. Artifacts must never land here.
-MONITORED_ROOT = Path("/home/user")
+#: Environment variable naming the monitored tree, so the engine is not hard-wired
+#: to one host layout. CI runners have no ``/home/user``; they must point this at a
+#: throwaway directory instead.
+WORKSPACE_ENV_VAR = "GRAVO_WORKSPACE"
+
+#: Default location of the quota-constrained persistent tree when the environment
+#: does not override it.
+DEFAULT_MONITORED_ROOT = Path("/home/user")
+
+
+def monitored_root_from_env() -> Path:
+    """Resolve the monitored tree, honouring :data:`WORKSPACE_ENV_VAR`.
+
+    Read at call time rather than import time so tests (and CI) can redirect it
+    with ``monkeypatch.setenv`` without re-importing the module.
+    """
+    override = os.environ.get(WORKSPACE_ENV_VAR)
+    return Path(override).expanduser() if override else DEFAULT_MONITORED_ROOT
+
+
+#: Backwards-compatible module-level view. Prefer :func:`monitored_root_from_env`,
+#: which reflects the current environment rather than the import-time value.
+MONITORED_ROOT = DEFAULT_MONITORED_ROOT
 
 #: Google's documented granularity for resumable upload; also the connector contract.
 CHUNK_SIZE = 256 * 1024
@@ -86,8 +111,14 @@ def chunk_plan(total_bytes: int, chunk_size: int = CHUNK_SIZE) -> list[int]:
     return plan
 
 
-def workspace_footprint(root: Path = MONITORED_ROOT) -> int:
-    """Sum retained bytes under the monitored tree, ignoring regenerable caches."""
+def workspace_footprint(root: Path | None = None) -> int:
+    """Sum retained bytes under the monitored tree, ignoring regenerable caches.
+
+    A root that does not exist contributes zero rather than raising: the monitored
+    tree is an accounting concept, and its absence must never break a run.
+    """
+    if root is None:
+        root = monitored_root_from_env()
     total = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _VOLATILE_DIRS]
@@ -419,7 +450,7 @@ class ArtifactEgress:
     milestone: str | None = None
     run_id: str | None = None
     buffer_root: Path = DEFAULT_BUFFER_ROOT
-    receipt_dir: Path = MONITORED_ROOT
+    receipt_dir: Path | None = None
     buffer_limit_bytes: int = DEFAULT_BUFFER_LIMIT_BYTES
     sink: Sink | None = None
     sessions: dict[str, str] = field(default_factory=dict)
@@ -428,6 +459,10 @@ class ArtifactEgress:
     folder_id: str | None = None
     service: Any | None = None
     keep_buffer_on_error: bool = False
+    #: The monitored tree this run accounts against. Resolved from the environment
+    #: on first use so a redirected workspace applies to footprint accounting,
+    #: containment checks and the receipt alike.
+    monitored_root: Path | None = None
 
     _buffer: Path | None = field(default=None, init=False, repr=False)
     _pending: list[tuple[str, Path]] = field(default_factory=list, init=False, repr=False)
@@ -444,12 +479,19 @@ class ArtifactEgress:
     def __enter__(self) -> ArtifactEgress:
         self._started = datetime.now(UTC).isoformat(timespec="seconds")
         self.run_id = self.run_id or f"run-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
-        self._footprint_before = workspace_footprint(MONITORED_ROOT)
+        root = self.monitored_root or monitored_root_from_env()
+        self.monitored_root = Path(root).expanduser()
+        self.receipt_dir = self.receipt_dir or self.monitored_root
+        self._footprint_before = workspace_footprint(self.monitored_root)
         self._buffer = self.buffer_root / self.run_id
         if self._buffer.exists():  # pragma: no cover - defensive
             shutil.rmtree(self._buffer)
-        self._buffer.mkdir(parents=True, exist_ok=False)
+        # Validate before creating. Creating first let ``mkdir(parents=True)`` try to
+        # build the monitored tree itself on hosts where it does not exist (a CI
+        # runner has no /home/user), raising PermissionError *before* the guard that
+        # was supposed to reject the placement.
         self._assert_outside_monitored(self._buffer)
+        self._buffer.mkdir(parents=True, exist_ok=False)
         try:
             if self.sink is None:
                 self.sink = resolve_sink(
@@ -501,9 +543,10 @@ class ArtifactEgress:
         return self._buffer
 
     def _assert_outside_monitored(self, path: Path) -> None:
+        root = self.monitored_root or monitored_root_from_env()
         resolved = path.resolve()
         try:
-            resolved.relative_to(MONITORED_ROOT.resolve())
+            resolved.relative_to(Path(root).expanduser().resolve())
         except ValueError:
             return
         raise EgressError(f"refusing to place the egress buffer inside the monitored tree: {resolved}")
@@ -612,14 +655,14 @@ class ArtifactEgress:
                 "artifacts_unverified": unverified,
             },
             "workspace": {
-                "monitored_root": str(MONITORED_ROOT),
+                "monitored_root": str(self.monitored_root),
                 "bytes_before": self._footprint_before,
             },
         }
 
     def _write_receipt(self) -> None:
         payload = self._receipt_payload()
-        payload["workspace"]["bytes_after"] = workspace_footprint(MONITORED_ROOT)
+        payload["workspace"]["bytes_after"] = workspace_footprint(self.monitored_root)
         payload["workspace"]["delta_bytes"] = payload["workspace"]["bytes_after"] - payload["workspace"]["bytes_before"]
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         payload["receipt_sha256"] = digest

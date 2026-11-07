@@ -9,6 +9,22 @@ on:  # yamllint disable-line rule:truthy
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The suite must never reach the network: every HTTP surface is mocked.
+  PIP_NO_CACHE_DIR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Deterministic iteration order, independent of the runner's hash seed.
+  PYTHONHASHSEED: "0"
+  TMP_ROOT: /tmp
+  # The monitored tree does not exist on a runner. Point it at throwaway space so
+  # egress footprint accounting is meaningful instead of absent.
+  GRAVO_WORKSPACE: ${{ runner.temp }}/workspace
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -18,10 +34,14 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
+          cache: pip
 
       - name: Show toolchain
         run: python --version && git --version
+
+      - name: Prepare the monitored workspace
+        run: mkdir -p "$GRAVO_WORKSPACE"
 
       # Tests run before lint, matching the required local order.
       - name: make test
